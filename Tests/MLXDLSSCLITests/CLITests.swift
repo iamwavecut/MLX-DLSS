@@ -1364,7 +1364,18 @@ final class CLITests: XCTestCase {
     )
   }
 
+  /// The binary under test: `MLXDLSS_BINARY`, else the `mlxdlss` built next to
+  /// this test bundle (so `swift test -c release` exercises the release build),
+  /// else the package's debug build.
   private func cliExecutableURL() -> URL {
+    if let override = ProcessInfo.processInfo.environment["MLXDLSS_BINARY"], !override.isEmpty {
+      return URL(fileURLWithPath: override)
+    }
+    let sibling = Bundle(for: CLITests.self).bundleURL.deletingLastPathComponent()
+      .appendingPathComponent("mlxdlss")
+    if FileManager.default.isExecutableFile(atPath: sibling.path) {
+      return sibling
+    }
     var url = URL(fileURLWithPath: #filePath)
     for _ in 0..<3 {
       url.deleteLastPathComponent()

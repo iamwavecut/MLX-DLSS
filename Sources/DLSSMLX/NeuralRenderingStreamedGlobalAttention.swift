@@ -13,11 +13,6 @@ enum NeuralRenderingStreamedGlobalAttention {
   nonisolated(unsafe) static var v2Enabled: Bool =
     ProcessInfo.processInfo.environment["MLXDLSS_GLOBAL_ATTENTION_V2"] != "0"
   static var residentMaxTokens: Int { v2Enabled ? 1024 : 512 }
-  /// Two-pass kernels above the resident limit take 128 keys per tile when
-  /// `MLXDLSS_GLOBAL_TILE=128` (default 32); `MLXDLSS_STREAMED_GLOBAL_ATTENTION=1`
-  /// forces them instead of the materialized attention.
-  nonisolated(unsafe) static var wideTiles: Bool =
-    ProcessInfo.processInfo.environment["MLXDLSS_GLOBAL_TILE"] == "128"
 
   /// Longer sequences keep the materialized attention unless streaming is forced.
   static func isEnabled(tokens: Int) -> Bool {
@@ -253,144 +248,11 @@ enum NeuralRenderingStreamedGlobalAttention {
       return output[0..., 0..., 0..<tokens, 0...]
     }
     let grid = (128, (tokens + 7) / 8, query.dim(0) * query.dim(1))
-    if wideTiles {
-      let reciprocal = denominatorWide([query, key], grid: grid, threadGroup: (128, 1, 1),
-        outputShapes: [Array(query.shape.dropLast())], outputDTypes: [.float16])[0]
-      return attentionWide([query, key, value, reciprocal], grid: grid, threadGroup: (128, 1, 1),
-        outputShapes: [query.shape], outputDTypes: [.float16])[0]
-    }
     let reciprocal = denominatorV2([query, key], grid: grid, threadGroup: (128, 1, 1),
       outputShapes: [Array(query.shape.dropLast())], outputDTypes: [.float16])[0]
     return attentionV2([query, key, value, reciprocal], grid: grid, threadGroup: (128, 1, 1),
       outputShapes: [query.shape], outputDTypes: [.float16])[0]
   }
-
-  // MARK: - two-pass kernels with 128-key tiles
-
-  /// Query tile setup shared by the wide two-pass kernels: 128 keys per tile.
-  private static let setupWide = #"""
-    const uint tid = thread_position_in_threadgroup.x;
-    const uint simd = simdgroup_index_in_threadgroup;
-    const uint tokens = uint(query_shape[2]);
-    const uint head = threadgroup_position_in_grid.z;
-    const uint row0 = threadgroup_position_in_grid.y * 8;
-    const uint headBase = head * tokens * 32;
-    threadgroup half Q[8 * 32];
-    threadgroup half K[128 * 32];
-    threadgroup half S[8 * 128];
-    for (uint i = tid; i < 8 * 32; i += 128) {
-      uint row = row0 + i / 32;
-      Q[i] = row < tokens ? query[headBase + row * 32 + i % 32] : 0.0h;
-    }
-    """#
-
-  private static let wideHeader = #"""
-    // Scores of eight queries against the 128 keys from `token0`, clamped like the
-    // resident kernel, then vendor weights for the valid columns on every thread.
-    METAL_FUNC void score_tile_wide(
-      threadgroup half* Q, threadgroup half* K, threadgroup half* S,
-      const device half* key, uint headBase, uint token0, uint tokens, uint tid, uint simd
-    ) {
-      for (uint i = tid; i < 128 * 32; i += 128) {
-        uint token = token0 + i / 32;
-        K[i] = token < tokens ? key[headBase + token * 32 + i % 32] : 0.0h;
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint block = simd; block < 16; block += 4) {
-        simdgroup_matrix<float, 8, 8> acc;
-        acc.thread_elements()[0] = 0.0f;
-        acc.thread_elements()[1] = 0.0f;
-        for (uint c = 0; c < 32; c += 8) {
-          simdgroup_matrix<half, 8, 8> q, k;
-          simdgroup_load(q, Q + c, 32, ulong2(0), false);
-          simdgroup_load(k, K + block * 8 * 32 + c, 32, ulong2(0), true);
-          simdgroup_matrix<float, 8, 8> left, right;
-          left.thread_elements()[0] = float(q.thread_elements()[0]);
-          left.thread_elements()[1] = float(q.thread_elements()[1]);
-          right.thread_elements()[0] = float(k.thread_elements()[0]);
-          right.thread_elements()[1] = float(k.thread_elements()[1]);
-          simdgroup_multiply_accumulate(acc, left, right, acc);
-        }
-        simdgroup_matrix<half, 8, 8> scores;
-        scores.thread_elements()[0] = clamp(half(acc.thread_elements()[0]), -3.0h, 3.0h);
-        scores.thread_elements()[1] = clamp(half(acc.thread_elements()[1]), -3.0h, 3.0h);
-        simdgroup_store(scores, S + block * 8, 128, ulong2(0), false);
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      const uint valid = min(128u, tokens - token0);
-      for (uint i = tid; i < 8 * 64; i += 128) {
-        const uint row = i / 64;
-        const uint j = (i % 64) * 2;
-        if (j < valid) {
-          half2 weight = vendor_weights(half2(S[row * 128 + j], S[row * 128 + j + 1]));
-          S[row * 128 + j] = weight.x;
-          S[row * 128 + j + 1] = weight.y;
-        }
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    """#
-
-  private static let denominatorWide = MLXFast.metalKernel(
-    name: "mlxdlss_global_attention_denominator_wide", inputNames: ["query", "key"], outputNames: ["reciprocal"],
-    source: setupWide + #"""
-      half total = 0.0h;
-      for (uint token0 = 0; token0 < tokens; token0 += 128) {
-        score_tile_wide(Q, K, S, key, headBase, token0, tokens, tid, simd);
-        if (tid < 8) {
-          const uint valid = min(128u, tokens - token0);
-          for (uint j = 0; j < valid; ++j) { total += S[tid * 128 + j]; }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      }
-      if (tid < 8 && row0 + tid < tokens) {
-        reciprocal[head * tokens + row0 + tid] = half(1.0f / float(total));
-      }
-      """#, header: header + wideHeader)
-
-  private static let attentionWide = MLXFast.metalKernel(
-    name: "mlxdlss_global_attention_values_wide", inputNames: ["query", "key", "value", "reciprocal"], outputNames: ["output"],
-    source: setupWide + #"""
-      simdgroup_matrix<float, 8, 8> attended;
-      attended.thread_elements()[0] = 0.0f;
-      attended.thread_elements()[1] = 0.0f;
-      for (uint token0 = 0; token0 < tokens; token0 += 128) {
-        score_tile_wide(Q, K, S, key, headBase, token0, tokens, tid, simd);
-        for (uint i = tid; i < 8 * 128; i += 128) {
-          const uint row = i / 128;
-          const uint j = i % 128;
-          const half r = row0 + row < tokens ? reciprocal[head * tokens + row0 + row] : 0.0h;
-          S[i] = token0 + j < tokens ? half(float(mlxdlss_e4m3(S[i] * r))) : 0.0h;
-        }
-        // K's storage is now free for the matching value rows.
-        for (uint i = tid; i < 128 * 32; i += 128) {
-          uint token = token0 + i / 32;
-          K[i] = token < tokens ? value[headBase + token * 32 + i % 32] : 0.0h;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint c = 0; c < 128; c += 8) {
-          simdgroup_matrix<half, 8, 8> p, v;
-          simdgroup_load(p, S + c, 128, ulong2(0), false);
-          simdgroup_load(v, K + c * 32 + simd * 8, 32, ulong2(0), false);
-          simdgroup_matrix<float, 8, 8> left, right;
-          left.thread_elements()[0] = float(p.thread_elements()[0]);
-          left.thread_elements()[1] = float(p.thread_elements()[1]);
-          right.thread_elements()[0] = float(v.thread_elements()[0]);
-          right.thread_elements()[1] = float(v.thread_elements()[1]);
-          simdgroup_multiply_accumulate(attended, left, right, attended);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      }
-      simdgroup_matrix<half, 8, 8> result;
-      result.thread_elements()[0] = half(float(mlxdlss_e4m3(half(attended.thread_elements()[0]))));
-      result.thread_elements()[1] = half(float(mlxdlss_e4m3(half(attended.thread_elements()[1]))));
-      simdgroup_store(result, S + simd * 8, 32, ulong2(0), false);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint i = tid; i < 8 * 32; i += 128) {
-        uint row = row0 + i / 32;
-        if (row < tokens) output[headBase + row * 32 + i % 32] = S[i];
-      }
-      """#, header: header + wideHeader)
 
   private static let residentV2 = MLXFast.metalKernel(
     name: "mlxdlss_global_attention_resident_v2", inputNames: ["query", "key", "value"], outputNames: ["output"],
