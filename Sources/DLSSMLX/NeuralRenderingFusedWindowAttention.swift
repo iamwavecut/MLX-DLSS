@@ -36,6 +36,26 @@ enum NeuralRenderingKernelParameters {
 enum NeuralRenderingFusedWindowAttention {
   static let windowSize = 8
   static let simdgroupsPerWindow = 4
+  /// Perf spike: `MLXDLSS_WINDOW_SOFTMAX_V2=1` computes the vendor weights and
+  /// probabilities on every lane and keeps only the half denominator sums
+  /// sequential (16 lanes for both window rows).
+  nonisolated(unsafe) static var softmaxV2Enabled: Bool =
+    ProcessInfo.processInfo.environment["MLXDLSS_WINDOW_SOFTMAX_V2"] == "1"
+  /// Perf spike: `MLXDLSS_WINDOW_KERNEL_V3=1` selects the register-blocked
+  /// kernels (each key/value/weight tile loaded once per pair of window rows,
+  /// hidden and probability tiles kept in registers, half tiles into float MMAs).
+  nonisolated(unsafe) static var kernelV3Enabled: Bool =
+    ProcessInfo.processInfo.environment["MLXDLSS_WINDOW_KERNEL_V3"] == "1"
+  static let vendorWeightsHeader = #"""
+    METAL_FUNC half2 mlxdlss_vendor_weights(half2 score) {
+      half2 affine = fma(score, half2(0.044921875h), half2(1.30078125h));
+      affine = clamp(affine, half2(1.03125h), half2(1.5693359375h));
+      ushort2 bits = as_type<ushort2>(affine);
+      uint packed = uint(bits.x) | (uint(bits.y) << 16);
+      uint transformed = (packed << 5) + 0x7FF88000;
+      return as_type<half2>(ushort2(ushort(transformed), ushort(transformed >> 16)));
+    }
+    """#
 
   private static let kernel = MLXFast.metalKernel(
     name: "mlxdlss_window_attention_core",
@@ -294,6 +314,516 @@ enum NeuralRenderingFusedWindowAttention {
     header: "#include <metal_simdgroup_matrix>\n" + NeuralRenderingTransformerOperations.e4m3MetalHeaderText
   )
 
+  private static let kernelV3 = MLXFast.metalKernel(
+    name: "mlxdlss_window_attention_core_v3",
+    inputNames: ["qkv", "attentionScale", "attentionBias", "params"],
+    outputNames: ["output"],
+    source: #"""
+      // Threadgroup memory (halfs): K 0..2048, V 2048..4096, 640 of scratch per simdgroup
+      // (512 for the query rows / scores, then 16 reciprocals).
+      threadgroup half4 arena4[(4096 + 4 * 640) / 4];
+      threadgroup half* arena = (threadgroup half*)arena4;
+      threadgroup half* K = arena;
+      threadgroup half* V = arena + 2048;
+      threadgroup half4* K4 = (threadgroup half4*)K;
+      threadgroup half4* V4 = (threadgroup half4*)V;
+      const uint simd = simdgroup_index_in_threadgroup;
+      const uint lane = thread_index_in_simdgroup;
+      const uint tid = thread_position_in_threadgroup.x;
+      threadgroup half* T = arena + 4096 + simd * 640;
+      threadgroup half4* T4 = (threadgroup half4*)T;
+      threadgroup half* R = T + 512;   // reused: 16 reciprocals (query norm), 8 (softmax)
+
+      const uint height = params[0];
+      const uint width = params[1];
+      const uint padTop = params[2];
+      const uint padLeft = params[3];
+      const uint headCount = params[4];
+      const uint channels = headCount * 32;
+      const uint rowStride = channels * 3;
+      const uint windowsX = (width + padLeft + 7) / 8;
+      const uint head = threadgroup_position_in_grid.x % headCount;
+      const uint windowIndex = threadgroup_position_in_grid.x / headCount;
+      const uint windowY = windowIndex / windowsX;
+      const uint windowX = windowIndex % windowsX;
+      const int rowY0 = int(windowY * 8) - int(padTop);
+      const int colX0 = int(windowX * 8) - int(padLeft);
+      const device half4* qkv4 = (const device half4*)qkv;
+      device half4* output4 = (device half4*)output;
+      const device half4* attentionBias4 = (const device half4*)attentionBias;
+      const half scale = attentionScale[head];
+
+      // Phase 0: this simdgroup's 16 tokens. Keys: stage, cosine-normalise (one
+      // lane per token, sequential partial sums), publish into the shared K rows.
+      // Values: stage, publish into the shared V rows.
+      for (uint part = 1; part < 3; ++part) {
+        for (uint i = lane; i < 128; i += 32) {
+          const uint token = simd * 16 + i / 8;
+          const int y = rowY0 + int(token / 8);
+          const int x = colX0 + int(token % 8);
+          const bool in = y >= 0 && y < int(height) && x >= 0 && x < int(width);
+          T4[i] = in ? qkv4[((uint(y) * width + uint(x)) * rowStride + part * channels + head * 32) / 4 + i % 8] : half4(0.0h);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (part == 1) {
+          if (lane < 16) {
+            threadgroup half* vec = T + lane * 32;
+            half value[32];
+            for (uint c = 0; c < 32; ++c) { value[c] = vec[c]; }
+            half partial[4][2];
+            for (uint l = 0; l < 4; ++l) {
+              for (uint parity = 0; parity < 2; ++parity) {
+                uint c = l * 2 + parity;
+                half first = fma(value[c + 8], value[c + 8], value[c] * value[c]);
+                half second = fma(value[c + 24], value[c + 24], value[c + 16] * value[c + 16]);
+                partial[l][parity] = first + second;
+              }
+            }
+            half xorTwo[4][2];
+            for (uint l = 0; l < 4; ++l) {
+              for (uint parity = 0; parity < 2; ++parity) {
+                xorTwo[l][parity] = partial[l][parity] + partial[l ^ 2][parity];
+              }
+            }
+            half xorOne[4][2];
+            for (uint l = 0; l < 4; ++l) {
+              for (uint parity = 0; parity < 2; ++parity) {
+                xorOne[l][parity] = xorTwo[l][parity] + xorTwo[l ^ 1][parity];
+              }
+            }
+            half norm = max(xorOne[0][0] + xorOne[0][1], half(0.00006198883056640625));
+            R[lane] = half(metal::fast::rsqrt(float(norm)));
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          for (uint i = lane; i < 128; i += 32) {
+            half4 normalized = T4[i] * R[i / 8];
+            K4[(simd * 16 + i / 8) * 8 + i % 8] = half4(
+              half(float(mlxdlss_e4m3(normalized.x))), half(float(mlxdlss_e4m3(normalized.y))),
+              half(float(mlxdlss_e4m3(normalized.z))), half(float(mlxdlss_e4m3(normalized.w))));
+          }
+        } else {
+          for (uint i = lane; i < 128; i += 32) {
+            half4 value = T4[i];
+            V4[(simd * 16 + i / 8) * 8 + i % 8] = half4(
+              half(float(mlxdlss_e4m3(value.x))), half(float(mlxdlss_e4m3(value.y))),
+              half(float(mlxdlss_e4m3(value.z))), half(float(mlxdlss_e4m3(value.w))));
+          }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+      }
+
+      // Queries of this simdgroup's 16 tokens: stage, normalise with the head
+      // scale (one lane per token for the norm), publish, load as tiles.
+      for (uint i = lane; i < 128; i += 32) {
+        const uint token = simd * 16 + i / 8;
+        const int y = rowY0 + int(token / 8);
+        const int x = colX0 + int(token % 8);
+        const bool in = y >= 0 && y < int(height) && x >= 0 && x < int(width);
+        T4[i] = in ? qkv4[((uint(y) * width + uint(x)) * rowStride + head * 32) / 4 + i % 8] : half4(0.0h);
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      if (lane < 16) {
+        threadgroup half* vec = T + lane * 32;
+        half value[32];
+        for (uint c = 0; c < 32; ++c) { value[c] = vec[c]; }
+        half partial[4][2];
+        for (uint l = 0; l < 4; ++l) {
+          for (uint parity = 0; parity < 2; ++parity) {
+            uint c = l * 2 + parity;
+            half first = fma(value[c + 8], value[c + 8], value[c] * value[c]);
+            half second = fma(value[c + 24], value[c + 24], value[c + 16] * value[c + 16]);
+            partial[l][parity] = first + second;
+          }
+        }
+        half xorTwo[4][2];
+        for (uint l = 0; l < 4; ++l) {
+          for (uint parity = 0; parity < 2; ++parity) {
+            xorTwo[l][parity] = partial[l][parity] + partial[l ^ 2][parity];
+          }
+        }
+        half xorOne[4][2];
+        for (uint l = 0; l < 4; ++l) {
+          for (uint parity = 0; parity < 2; ++parity) {
+            xorOne[l][parity] = xorTwo[l][parity] + xorTwo[l ^ 1][parity];
+          }
+        }
+        half norm = max(xorOne[0][0] + xorOne[0][1], half(0.00006198883056640625));
+        R[lane] = half(metal::fast::rsqrt(float(norm)));
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint i = lane; i < 128; i += 32) {
+        half4 normalized = T4[i] * R[i / 8];
+        normalized *= scale;
+        T4[i] = half4(
+          half(float(mlxdlss_e4m3(normalized.x))), half(float(mlxdlss_e4m3(normalized.y))),
+          half(float(mlxdlss_e4m3(normalized.z))), half(float(mlxdlss_e4m3(normalized.w))));
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      simdgroup_matrix<half, 8, 8> qt[2][4];
+      for (uint rr = 0; rr < 2; ++rr) {
+        for (uint k = 0; k < 4; ++k) {
+          simdgroup_load(qt[rr][k], T + rr * 256 + k * 8, 32, ulong2(0), false);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      // Scores for both window rows with each key tile loaded once (row 1 waits
+      // in registers); per row: bias, the bit-affine softmax with E4M3
+      // probabilities kept as tiles; attended = E4M3(P · v) with each value tile
+      // loaded once for both rows; store. Half tiles feed the float accumulators
+      // directly (bit-identical to converting them first).
+      simdgroup_matrix<half, 8, 8> pending[8];
+      for (uint j = 0; j < 8; ++j) {
+        simdgroup_matrix<float, 8, 8> acc0, acc1;
+        acc0.thread_elements()[0] = 0.0f; acc0.thread_elements()[1] = 0.0f;
+        acc1.thread_elements()[0] = 0.0f; acc1.thread_elements()[1] = 0.0f;
+        for (uint k = 0; k < 4; ++k) {
+          simdgroup_matrix<half, 8, 8> keyT;
+          simdgroup_load(keyT, K + j * 8 * 32 + k * 8, 32, ulong2(0), true);
+          simdgroup_multiply_accumulate(acc0, qt[0][k], keyT, acc0);
+          simdgroup_multiply_accumulate(acc1, qt[1][k], keyT, acc1);
+        }
+        simdgroup_matrix<half, 8, 8> result;
+        result.thread_elements()[0] = half(acc0.thread_elements()[0]);
+        result.thread_elements()[1] = half(acc0.thread_elements()[1]);
+        simdgroup_store(result, T + j * 8, 64, ulong2(0), false);
+        pending[j].thread_elements()[0] = half(acc1.thread_elements()[0]);
+        pending[j].thread_elements()[1] = half(acc1.thread_elements()[1]);
+      }
+      simdgroup_matrix<half, 8, 8> probabilities[2][8];
+      for (uint rr = 0; rr < 2; ++rr) {
+        const uint token0 = (simd * 2 + rr) * 8;
+        threadgroup half* S = T;
+        if (rr == 1) {
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          for (uint j = 0; j < 8; ++j) {
+            simdgroup_store(pending[j], S + j * 8, 64, ulong2(0), false);
+          }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = lane; i < 128; i += 32) {
+          T4[i] = T4[i] + attentionBias4[(head * 64 + token0 + i / 16) * 16 + i % 16];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < 8) {
+          threadgroup half* row = S + lane * 64;
+          half total = 0.0h;
+          for (uint j = 0; j < 64; j += 2) {
+            half2 score = half2(row[j], row[j + 1]);
+            half2 affine = fma(score, half2(0.044921875h), half2(1.30078125h));
+            affine = clamp(affine, half2(1.03125h), half2(1.5693359375h));
+            ushort2 bits = as_type<ushort2>(affine);
+            uint packed = uint(bits.x) | (uint(bits.y) << 16);
+            uint transformed = (packed << 5) + 0x7FF88000;
+            half2 weight = as_type<half2>(ushort2(ushort(transformed), ushort(transformed >> 16)));
+            total += weight.x;
+            total += weight.y;
+          }
+          R[lane] = half(1.0f / float(total));
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = lane; i < 128; i += 32) {
+          const half reciprocal = R[i / 16];
+          half4 scores = T4[i];
+          half4 probability;
+          for (uint p = 0; p < 2; ++p) {
+            half2 score = p == 0 ? scores.xy : scores.zw;
+            half2 affine = fma(score, half2(0.044921875h), half2(1.30078125h));
+            affine = clamp(affine, half2(1.03125h), half2(1.5693359375h));
+            ushort2 bits = as_type<ushort2>(affine);
+            uint packed = uint(bits.x) | (uint(bits.y) << 16);
+            uint transformed = (packed << 5) + 0x7FF88000;
+            half2 weight = as_type<half2>(ushort2(ushort(transformed), ushort(transformed >> 16)));
+            half2 value = half2(
+              half(float(mlxdlss_e4m3(weight.x * reciprocal))), half(float(mlxdlss_e4m3(weight.y * reciprocal))));
+            if (p == 0) { probability.xy = value; } else { probability.zw = value; }
+          }
+          T4[i] = probability;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 8; ++k) {
+          simdgroup_load(probabilities[rr][k], S + k * 8, 64, ulong2(0), false);
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      simdgroup_matrix<half, 8, 8> at[2][4];
+      for (uint o = 0; o < 4; ++o) {
+        simdgroup_matrix<float, 8, 8> acc0, acc1;
+        acc0.thread_elements()[0] = 0.0f; acc0.thread_elements()[1] = 0.0f;
+        acc1.thread_elements()[0] = 0.0f; acc1.thread_elements()[1] = 0.0f;
+        for (uint k = 0; k < 8; ++k) {
+          simdgroup_matrix<half, 8, 8> valueTile;
+          simdgroup_load(valueTile, V + k * 8 * 32 + o * 8, 32, ulong2(0), false);
+          simdgroup_multiply_accumulate(acc0, probabilities[0][k], valueTile, acc0);
+          simdgroup_multiply_accumulate(acc1, probabilities[1][k], valueTile, acc1);
+        }
+        at[0][o].thread_elements()[0] = half(float(mlxdlss_e4m3(half(acc0.thread_elements()[0]))));
+        at[0][o].thread_elements()[1] = half(float(mlxdlss_e4m3(half(acc0.thread_elements()[1]))));
+        at[1][o].thread_elements()[0] = half(float(mlxdlss_e4m3(half(acc1.thread_elements()[0]))));
+        at[1][o].thread_elements()[1] = half(float(mlxdlss_e4m3(half(acc1.thread_elements()[1]))));
+      }
+      for (uint rr = 0; rr < 2; ++rr) {
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint o = 0; o < 4; ++o) {
+          simdgroup_store(at[rr][o], T + o * 8, 32, ulong2(0), false);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const int y = rowY0 + int(simd * 2 + rr);
+        for (uint i = lane; i < 64; i += 32) {
+          const int x = colX0 + int(i / 8);
+          if (y < 0 || y >= int(height) || x < 0 || x >= int(width)) { continue; }
+          output4[((uint(y) * width + uint(x)) * channels + head * 32) / 4 + i % 8] = T4[i];
+        }
+      }
+"""#,
+    header: "#include <metal_simdgroup_matrix>\n" + NeuralRenderingTransformerOperations.e4m3MetalHeaderText
+  )
+
+  private static let kernelV2 = MLXFast.metalKernel(
+    name: "mlxdlss_window_attention_core_v2",
+    inputNames: ["qkv", "attentionScale", "attentionBias", "params"],
+    outputNames: ["output"],
+    source: #"""
+      // Threadgroup memory (halfs): K 0..2048, V 2048..4096, 640 of scratch per simdgroup
+      // (512 for the query rows / scores, then 16 reciprocals).
+      threadgroup half4 arena4[(4096 + 4 * 1040) / 4];
+      threadgroup half* arena = (threadgroup half*)arena4;
+      threadgroup half* K = arena;
+      threadgroup half* V = arena + 2048;
+      threadgroup half4* K4 = (threadgroup half4*)K;
+      threadgroup half4* V4 = (threadgroup half4*)V;
+      const uint simd = simdgroup_index_in_threadgroup;
+      const uint lane = thread_index_in_simdgroup;
+      const uint tid = thread_position_in_threadgroup.x;
+      threadgroup half* T = arena + 4096 + simd * 1040;
+      threadgroup half4* T4 = (threadgroup half4*)T;
+      threadgroup half* R = T + 1024;   // 16 reciprocals (query norm), then 16 (softmax rows)
+
+      const uint height = params[0];
+      const uint width = params[1];
+      const uint padTop = params[2];
+      const uint padLeft = params[3];
+      const uint headCount = params[4];
+      const uint channels = headCount * 32;
+      const uint rowStride = channels * 3;
+      const uint windowsX = (width + padLeft + 7) / 8;
+      const uint head = threadgroup_position_in_grid.x % headCount;
+      const uint windowIndex = threadgroup_position_in_grid.x / headCount;
+      const uint windowY = windowIndex / windowsX;
+      const uint windowX = windowIndex % windowsX;
+      const int rowY0 = int(windowY * 8) - int(padTop);
+      const int colX0 = int(windowX * 8) - int(padLeft);
+      const device half4* qkv4 = (const device half4*)qkv;
+      device half4* output4 = (device half4*)output;
+      const device half4* attentionBias4 = (const device half4*)attentionBias;
+      const half scale = attentionScale[head];
+
+      // Phase 0: this simdgroup's 16 tokens. Keys: stage, cosine-normalise (one
+      // lane per token, sequential partial sums), publish into the shared K rows.
+      // Values: stage, publish into the shared V rows.
+      for (uint part = 1; part < 3; ++part) {
+        for (uint i = lane; i < 128; i += 32) {
+          const uint token = simd * 16 + i / 8;
+          const int y = rowY0 + int(token / 8);
+          const int x = colX0 + int(token % 8);
+          const bool in = y >= 0 && y < int(height) && x >= 0 && x < int(width);
+          T4[i] = in ? qkv4[((uint(y) * width + uint(x)) * rowStride + part * channels + head * 32) / 4 + i % 8] : half4(0.0h);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (part == 1) {
+          if (lane < 16) {
+            threadgroup half* vec = T + lane * 32;
+            half value[32];
+            for (uint c = 0; c < 32; ++c) { value[c] = vec[c]; }
+            half partial[4][2];
+            for (uint l = 0; l < 4; ++l) {
+              for (uint parity = 0; parity < 2; ++parity) {
+                uint c = l * 2 + parity;
+                half first = fma(value[c + 8], value[c + 8], value[c] * value[c]);
+                half second = fma(value[c + 24], value[c + 24], value[c + 16] * value[c + 16]);
+                partial[l][parity] = first + second;
+              }
+            }
+            half xorTwo[4][2];
+            for (uint l = 0; l < 4; ++l) {
+              for (uint parity = 0; parity < 2; ++parity) {
+                xorTwo[l][parity] = partial[l][parity] + partial[l ^ 2][parity];
+              }
+            }
+            half xorOne[4][2];
+            for (uint l = 0; l < 4; ++l) {
+              for (uint parity = 0; parity < 2; ++parity) {
+                xorOne[l][parity] = xorTwo[l][parity] + xorTwo[l ^ 1][parity];
+              }
+            }
+            half norm = max(xorOne[0][0] + xorOne[0][1], half(0.00006198883056640625));
+            R[lane] = half(metal::fast::rsqrt(float(norm)));
+          }
+          simdgroup_barrier(mem_flags::mem_threadgroup);
+          for (uint i = lane; i < 128; i += 32) {
+            half4 normalized = T4[i] * R[i / 8];
+            K4[(simd * 16 + i / 8) * 8 + i % 8] = half4(
+              half(float(mlxdlss_e4m3(normalized.x))), half(float(mlxdlss_e4m3(normalized.y))),
+              half(float(mlxdlss_e4m3(normalized.z))), half(float(mlxdlss_e4m3(normalized.w))));
+          }
+        } else {
+          for (uint i = lane; i < 128; i += 32) {
+            half4 value = T4[i];
+            V4[(simd * 16 + i / 8) * 8 + i % 8] = half4(
+              half(float(mlxdlss_e4m3(value.x))), half(float(mlxdlss_e4m3(value.y))),
+              half(float(mlxdlss_e4m3(value.z))), half(float(mlxdlss_e4m3(value.w))));
+          }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+      }
+
+      // Queries of this simdgroup's 16 tokens: stage, normalise with the head
+      // scale (one lane per token for the norm), publish, load as tiles.
+      for (uint i = lane; i < 128; i += 32) {
+        const uint token = simd * 16 + i / 8;
+        const int y = rowY0 + int(token / 8);
+        const int x = colX0 + int(token % 8);
+        const bool in = y >= 0 && y < int(height) && x >= 0 && x < int(width);
+        T4[i] = in ? qkv4[((uint(y) * width + uint(x)) * rowStride + head * 32) / 4 + i % 8] : half4(0.0h);
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      if (lane < 16) {
+        threadgroup half* vec = T + lane * 32;
+        half value[32];
+        for (uint c = 0; c < 32; ++c) { value[c] = vec[c]; }
+        half partial[4][2];
+        for (uint l = 0; l < 4; ++l) {
+          for (uint parity = 0; parity < 2; ++parity) {
+            uint c = l * 2 + parity;
+            half first = fma(value[c + 8], value[c + 8], value[c] * value[c]);
+            half second = fma(value[c + 24], value[c + 24], value[c + 16] * value[c + 16]);
+            partial[l][parity] = first + second;
+          }
+        }
+        half xorTwo[4][2];
+        for (uint l = 0; l < 4; ++l) {
+          for (uint parity = 0; parity < 2; ++parity) {
+            xorTwo[l][parity] = partial[l][parity] + partial[l ^ 2][parity];
+          }
+        }
+        half xorOne[4][2];
+        for (uint l = 0; l < 4; ++l) {
+          for (uint parity = 0; parity < 2; ++parity) {
+            xorOne[l][parity] = xorTwo[l][parity] + xorTwo[l ^ 1][parity];
+          }
+        }
+        half norm = max(xorOne[0][0] + xorOne[0][1], half(0.00006198883056640625));
+        R[lane] = half(metal::fast::rsqrt(float(norm)));
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint i = lane; i < 128; i += 32) {
+        half4 normalized = T4[i] * R[i / 8];
+        normalized *= scale;
+        T4[i] = half4(
+          half(float(mlxdlss_e4m3(normalized.x))), half(float(mlxdlss_e4m3(normalized.y))),
+          half(float(mlxdlss_e4m3(normalized.z))), half(float(mlxdlss_e4m3(normalized.w))));
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      simdgroup_matrix<half, 8, 8> qt[2][4];
+      for (uint rr = 0; rr < 2; ++rr) {
+        for (uint k = 0; k < 4; ++k) {
+          simdgroup_load(qt[rr][k], T + rr * 256 + k * 8, 32, ulong2(0), false);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      // Both window rows: scores into the per-row scratch, bias and vendor
+      // weights on every lane, sequential half denominators with one lane per
+      // query token, E4M3 probabilities on every lane, attended = E4M3(P · v).
+      for (uint rr = 0; rr < 2; ++rr) {
+        threadgroup half* S = T + rr * 512;
+        for (uint j = 0; j < 8; ++j) {
+          simdgroup_matrix<float, 8, 8> acc;
+          acc.thread_elements()[0] = 0.0f;
+          acc.thread_elements()[1] = 0.0f;
+          for (uint k = 0; k < 4; ++k) {
+            simdgroup_matrix<half, 8, 8> rightHalf;
+            simdgroup_load(rightHalf, K + j * 8 * 32 + k * 8, 32, ulong2(0), true);
+            simdgroup_matrix<float, 8, 8> left;
+            simdgroup_matrix<float, 8, 8> right;
+            left.thread_elements()[0] = float(qt[rr][k].thread_elements()[0]);
+            left.thread_elements()[1] = float(qt[rr][k].thread_elements()[1]);
+            right.thread_elements()[0] = float(rightHalf.thread_elements()[0]);
+            right.thread_elements()[1] = float(rightHalf.thread_elements()[1]);
+            simdgroup_multiply_accumulate(acc, left, right, acc);
+          }
+          simdgroup_matrix<half, 8, 8> result;
+          result.thread_elements()[0] = half(acc.thread_elements()[0]);
+          result.thread_elements()[1] = half(acc.thread_elements()[1]);
+          simdgroup_store(result, S + j * 8, 64, ulong2(0), false);
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint i = lane; i < 256; i += 32) {
+        const uint rr = i / 128;
+        const uint ii = i % 128;
+        const uint token0 = (simd * 2 + rr) * 8;
+        half4 scored = T4[i] + attentionBias4[(head * 64 + token0 + ii / 16) * 16 + ii % 16];
+        T4[i] = half4(mlxdlss_vendor_weights(scored.xy), mlxdlss_vendor_weights(scored.zw));
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      if (lane < 16) {
+        threadgroup half* row = T + (lane / 8) * 512 + (lane % 8) * 64;
+        half total = 0.0h;
+        for (uint j = 0; j < 64; ++j) { total += row[j]; }
+        R[lane] = half(1.0f / float(total));
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint i = lane; i < 256; i += 32) {
+        const uint rr = i / 128;
+        const uint ii = i % 128;
+        const half reciprocal = R[rr * 8 + ii / 16];
+        half4 weight = T4[i];
+        T4[i] = half4(
+          half(float(mlxdlss_e4m3(weight.x * reciprocal))), half(float(mlxdlss_e4m3(weight.y * reciprocal))),
+          half(float(mlxdlss_e4m3(weight.z * reciprocal))), half(float(mlxdlss_e4m3(weight.w * reciprocal))));
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint rr = 0; rr < 2; ++rr) {
+        threadgroup half* S = T + rr * 512;
+        simdgroup_matrix<half, 8, 8> at[4];
+        for (uint o = 0; o < 4; ++o) {
+          simdgroup_matrix<float, 8, 8> acc;
+          acc.thread_elements()[0] = 0.0f;
+          acc.thread_elements()[1] = 0.0f;
+          for (uint k = 0; k < 8; ++k) {
+            simdgroup_matrix<half, 8, 8> leftHalf;
+            simdgroup_matrix<half, 8, 8> rightHalf;
+            simdgroup_load(leftHalf, S + k * 8, 64, ulong2(0), false);
+            simdgroup_load(rightHalf, V + k * 8 * 32 + o * 8, 32, ulong2(0), false);
+            simdgroup_matrix<float, 8, 8> left;
+            simdgroup_matrix<float, 8, 8> right;
+            left.thread_elements()[0] = float(leftHalf.thread_elements()[0]);
+            left.thread_elements()[1] = float(leftHalf.thread_elements()[1]);
+            right.thread_elements()[0] = float(rightHalf.thread_elements()[0]);
+            right.thread_elements()[1] = float(rightHalf.thread_elements()[1]);
+            simdgroup_multiply_accumulate(acc, left, right, acc);
+          }
+          at[o].thread_elements()[0] = half(float(mlxdlss_e4m3(half(acc.thread_elements()[0]))));
+          at[o].thread_elements()[1] = half(float(mlxdlss_e4m3(half(acc.thread_elements()[1]))));
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint o = 0; o < 4; ++o) {
+          simdgroup_store(at[o], T + o * 8, 32, ulong2(0), false);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const int y = rowY0 + int(simd * 2 + rr);
+        for (uint i = lane; i < 64; i += 32) {
+          const int x = colX0 + int(i / 8);
+          if (y < 0 || y >= int(height) || x < 0 || x >= int(width)) { continue; }
+          output4[((uint(y) * width + uint(x)) * channels + head * 32) / 4 + i % 8] = T4[i];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+      }
+"""#,
+    header: "#include <metal_simdgroup_matrix>\n" + NeuralRenderingTransformerOperations.e4m3MetalHeaderText + vendorWeightsHeader
+  )
+
   /// E4M3-published attended values `[1, H, W, channels]` for projected rows
   /// `qkv` of shape `[1, H, W, 3 * channels]` (half precision).
   static func apply(
@@ -317,7 +847,7 @@ enum NeuralRenderingFusedWindowAttention {
     let windowsX = (width + padLeft + windowSize - 1) / windowSize
     let threadgroups = windowsY * windowsX * headCount
     let params = NeuralRenderingKernelParameters.array([UInt32(height), UInt32(width), UInt32(padTop), UInt32(padLeft), UInt32(headCount)])
-    return kernel(
+    return (kernelV3Enabled ? kernelV3 : softmaxV2Enabled ? kernelV2 : kernel)(
       [
         qkv, attentionScale.asType(.float16), attentionBias.asType(.float16).reshaped([headCount * 64 * 64]),
         params,

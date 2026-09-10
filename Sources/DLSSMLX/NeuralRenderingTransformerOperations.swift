@@ -191,7 +191,9 @@ enum NeuralRenderingGraphContract {
 }
 
 struct NeuralRenderingWindowBlock {
-  private let body: (MLXArray) -> MLXArray
+  private let body: (MLXArray, Bool?) -> MLXArray
+  /// Multi-head blocks fold the final residual and publication into one kernel.
+  private let fusesOutputResidual: Bool
   /// Single-kernel path (32 channels, one head) with the publication folded in.
   private let fusedBody: ((MLXArray, Bool) -> MLXArray)?
   private let publishesOutput: Bool
@@ -233,7 +235,7 @@ struct NeuralRenderingWindowBlock {
     let attentionCosine = try Self.require(
       weights, name: "\(prefix).attn_cos_skip", shape: [channels]
     )
-    let operation: (MLXArray) -> MLXArray
+    let operation: (MLXArray, Bool?) -> MLXArray
     var fusedWindow: ((MLXArray, Bool) -> MLXArray)?
     if channels >= 64 {
       let expansionWeight = try Self.require(
@@ -252,7 +254,7 @@ struct NeuralRenderingWindowBlock {
         ? NeuralRenderingTransformerOperations.denseExpansionWeight(expansionWeight) : nil
       let groupedProjection = compileBlock
         ? NeuralRenderingTransformerOperations.groupedProjectionWeight(branchProjectionWeight) : nil
-      operation = { input in
+      operation = { input, publishedOutput in
         NeuralRenderingTransformerOperations.branchedWindowBlock(
           input,
           expansionWeight: expansionWeight,
@@ -271,7 +273,8 @@ struct NeuralRenderingWindowBlock {
           fusedFeedForward: compileBlock,
           fusedAttention: compileBlock,
           denseExpansionWeight: denseExpansion,
-          groupedProjectionWeight: groupedProjection
+          groupedProjectionWeight: groupedProjection,
+          publishedOutput: publishedOutput
         )
       }
     } else {
@@ -281,7 +284,7 @@ struct NeuralRenderingWindowBlock {
       let feedForwardProjectionWeight = try Self.require(
         weights, name: "\(prefix).weight2", shape: [hiddenChannels, channels]
       )
-      operation = { input in
+      operation = { input, _ in
         NeuralRenderingTransformerOperations.windowBlock(
           input,
           expansionWeight: expansionWeight,
@@ -322,6 +325,8 @@ struct NeuralRenderingWindowBlock {
     // MLX compile currently changes custom vendor-kernel semantics.
     self.body = operation
     self.fusedBody = fusedWindow
+    self.fusesOutputResidual =
+      compileBlock && channels >= 64 && NeuralRenderingTransformerOperations.fusedOutputResidualEnabled
     // Block 0 is average-pooled before its single E4M3 publication and block 70
     // feeds the output head directly.
     self.publishesOutput = blockIndex != 0 && blockIndex != 70
@@ -331,7 +336,10 @@ struct NeuralRenderingWindowBlock {
     if let fusedBody, input.dtype == .float16, input.shape[0] == 1 {
       return fusedBody(input, publishesOutput)
     }
-    let output = body(input)
+    if fusesOutputResidual, input.dtype == .float16 {
+      return body(input, publishesOutput)
+    }
+    let output = body(input, nil)
     return publishesOutput
       ? NeuralRenderingTransformerOperations.e4m3RoundTrip(output)
       : output
@@ -344,7 +352,10 @@ struct NeuralRenderingWindowBlock {
     if let fusedBody, input.dtype == .float16, input.shape[0] == 1 {
       return fusedBody(input, false)
     }
-    return body(input)
+    if fusesOutputResidual, input.dtype == .float16 {
+      return body(input, false)
+    }
+    return body(input, nil)
   }
 
   private static func require(
@@ -483,26 +494,28 @@ struct NeuralRenderingSplitWindowBlock {
   }
 
   func callAsFunction(_ input: MLXArray) -> MLXArray {
-    NeuralRenderingTransformerOperations.e4m3RoundTrip(
-      NeuralRenderingTransformerOperations.splitWindowBlock(
-        input,
-        firstProjectionWeight: firstProjectionWeight,
-        expandWeight: groupExpandWeight,
-        projectWeight: groupProjectWeight,
-        feedForwardProjectionWeight: feedForwardProjectionWeight,
-        feedForwardCosine: feedForwardCosine,
-        qkvWeight: qkvWeight,
-        attentionScale: attentionScale,
-        attentionBias: attentionBias,
-        attentionProjectionWeight: attentionProjectionWeight,
-        attentionCosine: attentionCosine,
-        headCount: 16,
-        windowSize: NeuralRenderingGraphContract.windowSize,
-        windowOrigin: windowOrigin,
-        preciseSoftmax: preciseAttention,
-        fusedFeedForward: fusedFeedForward
-      )
+    let fusesOutput = fusedFeedForward && input.dtype == .float16
+      && NeuralRenderingTransformerOperations.fusedOutputResidualEnabled
+    let output = NeuralRenderingTransformerOperations.splitWindowBlock(
+      input,
+      firstProjectionWeight: firstProjectionWeight,
+      expandWeight: groupExpandWeight,
+      projectWeight: groupProjectWeight,
+      feedForwardProjectionWeight: feedForwardProjectionWeight,
+      feedForwardCosine: feedForwardCosine,
+      qkvWeight: qkvWeight,
+      attentionScale: attentionScale,
+      attentionBias: attentionBias,
+      attentionProjectionWeight: attentionProjectionWeight,
+      attentionCosine: attentionCosine,
+      headCount: 16,
+      windowSize: NeuralRenderingGraphContract.windowSize,
+      windowOrigin: windowOrigin,
+      preciseSoftmax: preciseAttention,
+      fusedFeedForward: fusedFeedForward,
+      publishedOutput: fusesOutput ? true : nil
     )
+    return fusesOutput ? output : NeuralRenderingTransformerOperations.e4m3RoundTrip(output)
   }
 
   private static func require(
@@ -738,9 +751,18 @@ struct NeuralRenderingGlobalStage {
     }
   }
 
+  /// Perf-spike diagnostic: `MLXDLSS_GLOBAL_EVAL=0` skips the per-block materialization.
+  nonisolated(unsafe) static var perBlockEvalEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLXDLSS_GLOBAL_EVAL"] != "0"
+
   func callAsFunction(_ input: MLXArray) -> MLXArray {
     let tokenCount = input.shape[1] * input.shape[2]
-    guard tokenCount > 64 else {
+    // Streamed attention keeps no quadratic intermediates, so the per-block
+    // materialization (and the cache clear that slows every later allocation)
+    // is only kept for the materialized path above the resident token limit.
+    let streamed = NeuralRenderingStreamedGlobalAttention.isEnabled(tokens: tokenCount)
+      && tokenCount <= NeuralRenderingStreamedGlobalAttention.residentMaxTokens
+    guard tokenCount > 64, Self.perBlockEvalEnabled || !streamed else {
       return blocks.reduce(input) { value, block in block(value) }
     }
     var value = input
@@ -1034,11 +1056,17 @@ struct NeuralRenderingDecoder {
 }
 
 struct NeuralRenderingPostBlock {
+  /// Perf spike: `MLXDLSS_FUSED_HEAD=1` runs the output head as one `[32, 8]`
+  /// GEMM whose column halves equal the two 16-wide GEMMs (zero taps add
+  /// nothing to the float accumulators), avoiding two full-resolution slice copies.
+  nonisolated(unsafe) static var fusedHeadEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLXDLSS_FUSED_HEAD"] == "1"
   private let sine: MLXArray
   private let cosine: MLXArray
   private let windowBlock: NeuralRenderingWindowBlock
-  private let outputGain: MLXArray
-  private let outputConvolution: MLXArray
+  let outputGain: MLXArray
+  let outputConvolution: MLXArray
+  let headWeight: MLXArray
 
   init(weights: ValidatedWeights, compileBlocks: Bool = false) throws {
     let prefix = "block70.layer0"
@@ -1056,12 +1084,21 @@ struct NeuralRenderingPostBlock {
       headCount: 1,
       compileBlock: compileBlocks
     )
-    self.outputGain = try Self.require(
+    let outputGain = try Self.require(
       weights, name: "\(prefix).out_gain", shape: [16, 4]
     )
-    self.outputConvolution = try Self.require(
+    let outputConvolution = try Self.require(
       weights, name: "\(prefix).out_conv_weight", shape: [16, 4]
     )
+    self.outputGain = outputGain
+    self.outputConvolution = outputConvolution
+    let zeros = MLXArray.zeros([16, 4], dtype: outputGain.dtype)
+    let headWeight = concatenated([
+      concatenated([outputGain, zeros], axis: 0),
+      concatenated([zeros, outputConvolution], axis: 0),
+    ], axis: 1)
+    eval(headWeight)
+    self.headWeight = headWeight
   }
 
   func callAsFunction(_ input: MLXArray, skip: MLXArray) -> MLXArray {
@@ -1083,9 +1120,20 @@ struct NeuralRenderingPostBlock {
       )
     }
     let features = windowBlock(merged)
+    return Self.head(features, gain: outputGain, convolution: outputConvolution,
+      headWeight: headWeight, fused: Self.fusedHeadEnabled)
+  }
+
+  static func head(
+    _ features: MLXArray, gain: MLXArray, convolution: MLXArray, headWeight: MLXArray, fused: Bool
+  ) -> MLXArray {
+    if fused {
+      let projected = matmul(features, headWeight)
+      return projected[0..., 0..., 0..., 0..<4] + projected[0..., 0..., 0..., 4..<8]
+    }
     let first = features[0..., 0..., 0..., 0..<16]
     let second = features[0..., 0..., 0..., 16..<32]
-    return matmul(first, outputGain) + matmul(second, outputConvolution)
+    return matmul(first, gain) + matmul(second, convolution)
   }
 
   private static func require(
@@ -1455,7 +1503,13 @@ enum NeuralRenderingTransformerOperations {
   /// 3.0 on each block); window-block kernels show no cap.
   static let globalAttentionLogitCap: Float = 3
   static let experimentalGlobalAttentionLogitCap: Float = globalAttentionLogitCap
-  static var e4m3MetalHeaderText: String { e4m3MetalHeader }
+  /// Perf spike: `MLXDLSS_FAST_E4M3=1` rounds half inputs with 16-bit integer
+  /// arithmetic (exhaustively verified bit-exact against the float path).
+  nonisolated(unsafe) static var fastE4M3Enabled: Bool =
+    ProcessInfo.processInfo.environment["MLXDLSS_FAST_E4M3"] == "1"
+  static var e4m3MetalHeaderText: String { fastE4M3Enabled ? fastE4M3MetalHeader : e4m3MetalHeader }
+  static var e4m3ReferenceMetalHeaderText: String { e4m3MetalHeader }
+  static var e4m3FastMetalHeaderText: String { fastE4M3MetalHeader }
 
   private static let e4m3MetalHeader = #"""
     struct mlxdlss_e4m3 {
@@ -1490,6 +1544,54 @@ enum NeuralRenderingTransformerOperations {
       }
 
       uint8_t bits;
+    };
+    """#
+  private static let fastE4M3MetalHeader = #"""
+    struct mlxdlss_e4m3 {
+      // Half inputs: saturate at 448, round-to-nearest-even at three mantissa bits,
+      // and quantise the E4M3 subnormal range (< 2^-6) to multiples of 2^-9 with
+      // the half magic-number add. Same value as the float path for every half.
+      mlxdlss_e4m3(half value) {
+        ushort b = as_type<ushort>(value);
+        ushort m = b & 0x7FFF;
+        // NaN inputs saturate to +448 like the float path (their sign is dropped by the conversion).
+        ushort s = m > 0x7C00 ? ushort(0) : ushort(b & 0x8000);
+        ushort normal = ushort((m + 0x3F + ((m >> 7) & 1)) & 0xFF80);
+        half small = (as_type<half>(m) + 2.0h) - 2.0h;
+        ushort r = m >= 0x5F00 ? ushort(0x5F00) : (m < 0x2400 ? as_type<ushort>(small) : normal);
+        rounded = as_type<half>(ushort(r | s));
+      }
+      mlxdlss_e4m3(float value) {
+        uint32_t fp8Max = 543 << 21;
+        uint32_t denormMask = 141 << 23;
+        uint32_t valueBits = as_type<uint32_t>(value);
+        uint32_t sign = valueBits & 0x80000000;
+        valueBits ^= sign;
+        uint8_t bits;
+        if (valueBits >= fp8Max) {
+          bits = 0x7E;
+        } else if (valueBits < (121 << 23)) {
+          valueBits = as_type<uint32_t>(
+            as_type<float>(valueBits) + as_type<float>(denormMask)
+          );
+          bits = static_cast<uint8_t>(valueBits - denormMask);
+        } else {
+          uint8_t mantissaOdd = (valueBits >> 20) & 1;
+          valueBits += ((uint32_t)(7 - 127) << 23) + 0x7FFFF;
+          valueBits += mantissaOdd;
+          bits = static_cast<uint8_t>(valueBits >> 20);
+        }
+        uint16_t halfBits = (bits & 127) << 7;
+        half converted = as_type<half>(halfBits);
+        converted *= 256.0;
+        rounded = sign ? -converted : converted;
+      }
+
+      operator float() {
+        return float(rounded);
+      }
+
+      half rounded;
     };
     """#
   private static let e4m3RoundTripKernel = MLXFast.metalKernel(
@@ -1856,8 +1958,38 @@ enum NeuralRenderingTransformerOperations {
     )[0]
   }
 
+  /// Perf spike: `MLXDLSS_E4M3_VEC=1` publishes half tensors four elements per thread.
+  nonisolated(unsafe) static var vectorizedE4M3Enabled: Bool =
+    ProcessInfo.processInfo.environment["MLXDLSS_E4M3_VEC"] == "1"
+  private static let e4m3RoundTripHalf4Kernel = MLXFast.metalKernel(
+    name: "mlxdlss_e4m3_round_trip_half4",
+    inputNames: ["input", "params"],
+    outputNames: ["output"],
+    source: #"""
+      const uint index = thread_position_in_grid.x;
+      if (index >= params[0]) { return; }
+      const device half4* input4 = (const device half4*)input;
+      device half4* output4 = (device half4*)output;
+      half4 value = input4[index];
+      output4[index] = half4(
+        half(float(mlxdlss_e4m3(value.x))), half(float(mlxdlss_e4m3(value.y))),
+        half(float(mlxdlss_e4m3(value.z))), half(float(mlxdlss_e4m3(value.w))));
+      """#,
+    header: e4m3MetalHeader
+  )
+
   static func e4m3RoundTrip(_ input: MLXArray) -> MLXArray {
     precondition(input.dtype == .float16 || input.dtype == .float32)
+    if vectorizedE4M3Enabled, input.dtype == .float16, input.size.isMultiple(of: 4), input.size > 0 {
+      let count = input.size / 4
+      return e4m3RoundTripHalf4Kernel(
+        [contiguous(input), NeuralRenderingKernelParameters.array([UInt32(count)])],
+        grid: (count, 1, 1),
+        threadGroup: (min(count, 256), 1, 1),
+        outputShapes: [input.shape],
+        outputDTypes: [.float16]
+      )[0]
+    }
     return e4m3RoundTripKernel(
       [input],
       template: [("elementCount", input.size)],
@@ -2375,6 +2507,10 @@ enum NeuralRenderingTransformerOperations {
     ProcessInfo.processInfo.environment["MLXDLSS_FUSED_ATTENTION"] != "0"
   nonisolated(unsafe) static var fusedResidualEnabled: Bool =
     ProcessInfo.processInfo.environment["MLXDLSS_FUSED_RESIDUAL"] != "0"
+  /// Perf spike: `MLXDLSS_FUSED_OUTPUT_RESIDUAL=1` folds the block's final
+  /// residual and its E4M3 publication into one kernel (multi-head and split families).
+  nonisolated(unsafe) static var fusedOutputResidualEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLXDLSS_FUSED_OUTPUT_RESIDUAL"] == "1"
   /// Diagnostics: head counts allowed to use the fused attention core (`MLXDLSS_FUSED_ATTENTION_HEADS=2,4`).
   nonisolated(unsafe) static var fusedAttentionHeadCounts: Set<Int>? =
     ProcessInfo.processInfo.environment["MLXDLSS_FUSED_ATTENTION_HEADS"].map { Set($0.split(separator: ",").compactMap { Int($0) }) }
@@ -2431,6 +2567,103 @@ enum NeuralRenderingTransformerOperations {
     return grouped
   }
 
+  /// Perf spike: `MLXDLSS_FUSED_GROUPED_PROJECTION=1` runs gate + E4M3 +
+  /// grouped projection + E4M3 as one kernel over the expansion output.
+  nonisolated(unsafe) static var fusedGroupedProjectionEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLXDLSS_FUSED_GROUPED_PROJECTION"] == "1"
+  /// Perf spike: `MLXDLSS_GROUPED_EXPANSION=1` runs the expansion as a broadcast
+  /// batched GEMM into the grouped layout, removing the hidden-tensor transposes.
+  nonisolated(unsafe) static var groupedExpansionEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLXDLSS_GROUPED_EXPANSION"] == "1"
+
+  private static let gateGroupedProjectionKernel = MLXFast.metalKernel(
+    name: "mlxdlss_gate_grouped_projection",
+    inputNames: ["expanded", "weight", "params"],
+    outputNames: ["output"],
+    source: #"""
+      // params = [rows, groups]. expanded: [rows, groups * 128] half (columns
+      // ordered (group, branch, c)); weight: [groups, 128, 32] half; output:
+      // [rows, groups * 32] half = E4M3(E4M3(gate(expanded_g)) · W_g), float
+      // accumulation over the 16 k-tiles in order, like the batched GEMM.
+      // One simdgroup: 32 rows × one group; a threadgroup covers up to four groups.
+      const uint rows = params[0];
+      const uint groups = params[1];
+      const uint simd = simdgroup_index_in_threadgroup;
+      const uint simdgroups = threads_per_threadgroup.x / 32;
+      const uint groupBlocks = (groups + simdgroups - 1) / simdgroups;
+      const uint rowBlock = threadgroup_position_in_grid.x / groupBlocks;
+      const uint group = (threadgroup_position_in_grid.x % groupBlocks) * simdgroups + simd;
+      if (group >= groups) { return; }
+      const uint row0 = rowBlock * 32;
+      const uint expandedStride = groups * 128;
+      const uint outputStride = groups * 32;
+      const device half* a = expanded + group * 128;
+      const device half* w = weight + group * 128 * 32;
+      simdgroup_matrix<float, 8, 8> acc[4][4];
+      for (uint t = 0; t < 4; ++t) {
+        for (uint o = 0; o < 4; ++o) {
+          acc[t][o].thread_elements()[0] = 0.0f;
+          acc[t][o].thread_elements()[1] = 0.0f;
+        }
+      }
+      const uint tiles = min(4u, (rows - row0) / 8);
+      for (uint k = 0; k < 16; ++k) {
+        simdgroup_matrix<float, 8, 8> right[4];
+        for (uint o = 0; o < 4; ++o) {
+          simdgroup_matrix<half, 8, 8> rh;
+          simdgroup_load(rh, w + k * 8 * 32 + o * 8, 32, ulong2(0), false);
+          right[o].thread_elements()[0] = float(rh.thread_elements()[0]);
+          right[o].thread_elements()[1] = float(rh.thread_elements()[1]);
+        }
+        for (uint t = 0; t < tiles; ++t) {
+          simdgroup_matrix<half, 8, 8> lh;
+          simdgroup_load(lh, a + (row0 + t * 8) * expandedStride + k * 8, expandedStride, ulong2(0), false);
+          simdgroup_matrix<float, 8, 8> left;
+          for (uint e = 0; e < 2; ++e) {
+            half value = lh.thread_elements()[e];
+            half clamped = clamp(value, half(-4.0), half(4.0));
+            half linear = fma(abs(clamped), half(-0.055908203125), half(0.447265625));
+            half gate = fma(clamped, linear, half(0.89453125));
+            left.thread_elements()[e] = float(mlxdlss_e4m3(value * gate));
+          }
+          for (uint o = 0; o < 4; ++o) {
+            simdgroup_multiply_accumulate(acc[t][o], left, right[o], acc[t][o]);
+          }
+        }
+      }
+      for (uint t = 0; t < tiles; ++t) {
+        for (uint o = 0; o < 4; ++o) {
+          simdgroup_matrix<half, 8, 8> result;
+          result.thread_elements()[0] = half(float(mlxdlss_e4m3(half(acc[t][o].thread_elements()[0]))));
+          result.thread_elements()[1] = half(float(mlxdlss_e4m3(half(acc[t][o].thread_elements()[1]))));
+          simdgroup_store(result, output + (row0 + t * 8) * outputStride + group * 32 + o * 8, outputStride, ulong2(0), false);
+        }
+      }
+      """#,
+    header: "#include <metal_simdgroup_matrix>\n" + e4m3MetalHeader
+  )
+
+  /// `e4m3(grouped projection of e4m3(gate(expanded)))` in one kernel; `expanded`
+  /// is `[rows, groups * 128]` half, `groupedWeight` `[groups, 128, 32]` half.
+  static func gateGroupedProjection(_ expanded: MLXArray, groupedWeight: MLXArray) -> MLXArray {
+    precondition(expanded.ndim == 2 && expanded.dtype == .float16 && groupedWeight.dtype == .float16)
+    let rows = expanded.shape[0]
+    let groups = groupedWeight.shape[0]
+    precondition(expanded.shape[1] == groups * 128 && groupedWeight.shape == [groups, 128, 32])
+    precondition(rows.isMultiple(of: 8))
+    let simdgroups = min(groups, 4)
+    let groupBlocks = (groups + simdgroups - 1) / simdgroups
+    let threadgroups = (rows + 31) / 32 * groupBlocks
+    let params = NeuralRenderingKernelParameters.array([UInt32(rows), UInt32(groups)])
+    return gateGroupedProjectionKernel(
+      [expanded, groupedWeight, params],
+      grid: (threadgroups * 32 * simdgroups, 1, 1),
+      threadGroup: (32 * simdgroups, 1, 1),
+      outputShapes: [[rows, groups * 32]],
+      outputDTypes: [.float16]
+    )[0]
+  }
+
   /// Branched feed-forward as dense GEMMs: expansion `[rows, C] × [C, 4C]`,
   /// gate + E4M3, grouped projection `[G, rows, 128] × [G, 128, 32]` (the
   /// branch sum folded into K), E4M3, output projection. Same publication
@@ -2445,7 +2678,22 @@ enum NeuralRenderingTransformerOperations {
     let groupCount = channels / 32
     let rowCount = input.size / channels
     let flat = input.reshaped([rowCount, channels])
-    let gated = quadraticGatePublish(matmul(flat, denseExpansionWeight))
+    if groupedExpansionEnabled {
+      // Per-group expansion straight into the grouped layout: [1, rows, C] × [G, C, 128]
+      // (a broadcast batch, no copy) gives [G, rows, 128]; every output column is
+      // the same K-sequential GEMM as its dense counterpart, so the values match.
+      let groupedExpansion = denseExpansionWeight.reshaped([channels, groupCount, 128]).transposed(1, 0, 2)
+      let expandedGrouped = matmul(flat.expandedDimensions(axis: 0), groupedExpansion)
+      let gated = quadraticGatePublish(expandedGrouped)
+      let projected = matmul(gated, groupedProjectionWeight).transposed(1, 0, 2).reshaped([rowCount, channels])
+      return matmul(e4m3RoundTrip(projected), outputProjectionWeight).reshaped(input.shape)
+    }
+    let expanded = matmul(flat, denseExpansionWeight)
+    if fusedGroupedProjectionEnabled, expanded.dtype == .float16, groupedProjectionWeight.dtype == .float16 {
+      let projected = gateGroupedProjection(expanded, groupedWeight: groupedProjectionWeight)
+      return matmul(projected, outputProjectionWeight).reshaped(input.shape)
+    }
+    let gated = quadraticGatePublish(expanded)
     let grouped = gated.reshaped([rowCount, groupCount, 128]).transposed(1, 0, 2)
     let projected = matmul(grouped, groupedProjectionWeight).transposed(1, 0, 2).reshaped([rowCount, channels])
     return matmul(e4m3RoundTrip(projected), outputProjectionWeight).reshaped(input.shape)
@@ -2469,7 +2717,8 @@ enum NeuralRenderingTransformerOperations {
     fusedFeedForward: Bool = false,
     fusedAttention: Bool = false,
     denseExpansionWeight: MLXArray? = nil,
-    groupedProjectionWeight: MLXArray? = nil
+    groupedProjectionWeight: MLXArray? = nil,
+    publishedOutput: Bool? = nil
   ) -> MLXArray {
     precondition(input.ndim == 4)
     let feedForwardBranch: MLXArray
@@ -2521,11 +2770,26 @@ enum NeuralRenderingTransformerOperations {
       preciseSoftmax: preciseSoftmax,
       fusedAttention: fusedAttention
     )
-    return cosineResidual(
-      skip: feedForwardOutput,
-      branch: attentionBranch,
-      cosine: attentionCosine
-    )
+    return outputResidual(
+      skip: feedForwardOutput, branch: attentionBranch, cosine: attentionCosine,
+      publishedOutput: publishedOutput)
+  }
+
+  /// The block's final residual. With `publishedOutput`, the caller delegates
+  /// the E4M3 publication: one fused kernel when the toggle allows, otherwise
+  /// the per-operation chain.
+  static func outputResidual(
+    skip: MLXArray, branch: MLXArray, cosine: MLXArray, publishedOutput: Bool?
+  ) -> MLXArray {
+    guard let publishedOutput else {
+      return cosineResidual(skip: skip, branch: branch, cosine: cosine)
+    }
+    if fusedOutputResidualEnabled, fusedResidualEnabled, skip.dtype == .float16, branch.dtype == .float16 {
+      return NeuralRenderingFusedWindowAttention.cosineResidual(
+        skip: skip, branch: branch, cosine: cosine, publish: publishedOutput)
+    }
+    let output = cosineResidual(skip: skip, branch: branch, cosine: cosine)
+    return publishedOutput ? e4m3RoundTrip(output) : output
   }
 
   static func downsample(
@@ -2623,7 +2887,8 @@ enum NeuralRenderingTransformerOperations {
     windowSize: Int,
     windowOrigin: NeuralRenderingWindowOrigin = .zero,
     preciseSoftmax: Bool = true,
-    fusedFeedForward: Bool = false
+    fusedFeedForward: Bool = false,
+    publishedOutput: Bool? = nil
   ) -> MLXArray {
     precondition(input.ndim == 4)
     let shape = input.shape
@@ -2659,11 +2924,9 @@ enum NeuralRenderingTransformerOperations {
       preciseSoftmax: preciseSoftmax,
       fusedAttention: fusedFeedForward
     )
-    return cosineResidual(
-      skip: feedForwardOutput,
-      branch: attentionBranch,
-      cosine: attentionCosine
-    )
+    return outputResidual(
+      skip: feedForwardOutput, branch: attentionBranch, cosine: attentionCosine,
+      publishedOutput: publishedOutput)
   }
 
   static func globalBlock(

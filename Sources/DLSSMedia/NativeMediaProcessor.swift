@@ -7,6 +7,10 @@ import Foundation
 /// time so that temporal state and MLX lazy graph construction cannot interleave.
 public actor NativeMediaProcessor {
   private var busy = false
+  /// Perf spike: `MLXDLSS_OVERLAP_MOTION=1` estimates the next frame's motion
+  /// while the current frame renders (rendering-then-generation order only).
+  nonisolated(unsafe) static var overlapMotionEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLXDLSS_OVERLAP_MOTION"] == "1"
   public init() {}
 
   public func processImage(input: URL, output: URL, options: MediaProcessingOptions) async throws -> MediaProcessingResult {
@@ -105,11 +109,16 @@ public actor NativeMediaProcessor {
     var previousSource: NativeDecodedFrame?
     var previousDisplay: MLXVideoFrame?
 
-    func render(_ source: MLXVideoFrame, isolation: isolated (any Actor)? = #isolation) async throws -> MLXVideoFrame {
+    func render(_ source: MLXVideoFrame, prepared: MLXVideoMotion?? = nil, isolation: isolated (any Actor)? = #isolation) async throws -> MLXVideoFrame {
       guard let renderer else { return source }
-      let motionStarted = ContinuousClock.now
-      let motion = try await flow?.prepare(source, index: renderIndex, sceneCutThreshold: options.sceneCutThreshold)
-      if flow != nil { timing.motionSeconds += seconds(since: motionStarted) }
+      let motion: MLXVideoMotion?
+      if let prepared {
+        motion = prepared
+      } else {
+        let motionStarted = ContinuousClock.now
+        motion = try await flow?.prepare(source, index: renderIndex, sceneCutThreshold: options.sceneCutThreshold)
+        if flow != nil { timing.motionSeconds += seconds(since: motionStarted) }
+      }
       if motion?.reset == true { resets += 1 }
       let renderingStarted = ContinuousClock.now
       let result = try await renderer.renderVideoFrame(source, motion: motion,
@@ -146,10 +155,59 @@ public actor NativeMediaProcessor {
 
     do {
       var current: NativeDecodedFrame? = first
+      let overlap = Self.overlapMotionEnabled && options.order != .generationThenRendering && flow != nil && renderer != nil
+      let threshold = options.sceneCutThreshold
+      // Motion for `current`, started while the previous frame rendered.
+      var pendingMotion: Task<(MLXVideoMotion?, Double), any Error>? = overlap ? Task.detached { [flow, rgb = first.rgb] in
+        let started = ContinuousClock.now
+        let motion = try await flow!.prepare(rgb, index: 0, sceneCutThreshold: threshold)
+        let elapsed = started.duration(to: .now).components
+        return (motion, Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18)
+      } : nil
       while let frame = current {
         try Task.checkCancellation()
         if let previousSource, frame.time <= previousSource.time {
           throw MLXMediaError("Input video timestamps are not increasing")
+        }
+        if overlap {
+          // Wait for this frame's motion (in order), decode the next frame and
+          // start its motion estimation, then render this frame on the GPU.
+          let (motion, motionSeconds) = try await pendingMotion!.value
+          timing.motionSeconds += motionSeconds
+          let decodingStarted = ContinuousClock.now
+          let next = try await reader.next()
+          timing.decodingSeconds += seconds(since: decodingStarted)
+          if let next {
+            let index = renderIndex + 1
+            pendingMotion = Task.detached { [flow, rgb = next.rgb] in
+              let started = ContinuousClock.now
+              let motion = try await flow!.prepare(rgb, index: index, sceneCutThreshold: threshold)
+              let elapsed = started.duration(to: .now).components
+              return (motion, Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18)
+            }
+          } else {
+            pendingMotion = nil
+          }
+          let display = try await render(frame.rgb, prepared: .some(motion))
+          if let generator, let previousSource, let previousDisplay {
+            let generationStarted = ContinuousClock.now
+            let intermediates = try await generator.interpolate(previousDisplay, display, factor: factor)
+            timing.generationSeconds += seconds(since: generationStarted)
+            for (index, intermediate) in intermediates.enumerated() {
+              let time = previousSource.time + CMTimeMultiplyByRatio(frame.time - previousSource.time,
+                multiplier: Int32(index + 1), divisor: Int32(factor))
+              try await emit(intermediate, sourceTime: time)
+            }
+          }
+          try await emit(display, sourceTime: frame.time)
+          previousDisplay = display
+          inputFrames += 1
+          lastDuration = frame.duration
+          previousSource = frame
+          await progress(MediaProgress(inputFrames: inputFrames, outputFrames: outputFrames,
+            estimatedInputFrames: reader.estimatedFrames, sceneResets: resets, elapsedSeconds: seconds(since: started)))
+          current = next
+          continue
         }
         if options.order == .generationThenRendering {
           if let generator, let previousSource {
