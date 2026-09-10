@@ -33,6 +33,27 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
   private var nativeGuides: (width: Int, height: Int, motion: MLXArray, depth: MLXArray)?
   private var nativeFrameInFlight = false
 
+  /// The stages of the last frame that live controls can re-apply without
+  /// re-running the head: composition-only controls need the postprocessed
+  /// output, the effect intensity needs the head output and its inputs.
+  private struct RetainedStages {
+    let head: MLXArray
+    let features: MLXArray
+    let color: MLXArray
+    let historyConfidence: MLXArray?
+    let controlMask: MLXArray?
+    let hadHistory: Bool
+    let postprocessed: MLXArray
+  }
+  private struct RetainedFrame {
+    var stages: RetainedStages
+    let source: MLXArray
+    let processingScale: Float
+    var intensity: Float
+  }
+  private var retainedStages: RetainedStages?
+  private var retainedFrame: RetainedFrame?
+
   /// - Parameter geometry: how logical frames map onto the network extent.
   ///   `vendorAligned` (default) pads every frame to the recovered minimum
   ///   `320` / multiple-of-`64` extent before the head and crops afterwards;
@@ -97,11 +118,15 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
     try videoOutput?.finish(to: output) ?? 0
   }
 
+  /// - Parameter evaluated: `false` returns a frame whose graph is scheduled but
+  ///   may still be running, so the caller can overlap it with other work; every
+  ///   consumer evaluates before reading the bytes.
   public func renderVideoFrame(
     _ frame: MLXVideoFrame, motion: MLXVideoMotion?,
     context: NeuralRenderFrameContext, processingScale: Float = 1, temporal: Bool = true,
     outputOptions: MLXVideoOutputOptions? = nil,
-    featureControls: NeuralRenderingFeatureControls? = nil, intensity: Float? = nil
+    featureControls: NeuralRenderingFeatureControls? = nil, intensity: Float? = nil,
+    evaluated: Bool = true
   ) async throws -> MLXVideoFrame {
     guard !nativeFrameInFlight else { throw MLXMediaError("Submit native NR frames sequentially") }
     nativeFrameInFlight = true
@@ -138,7 +163,51 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
       depth: nativeGuides!.depth, controlMask: nil, historyConfidence: confidence,
       descriptors: descriptors, evaluateOutput: false,
       featureControls: featureControls, intensity: intensity)
-    return MLXVideoFrame(composition(result.output, source: frame.array))
+    if let stages = retainedStages {
+      retainedFrame = RetainedFrame(stages: stages, source: frame.array, processingScale: processingScale,
+        intensity: intensity ?? controlMaskIntensity)
+    }
+    let composed = composition(result.output, source: frame.array)
+    return evaluated ? MLXVideoFrame(composed) : MLXVideoFrame(scheduling: composed)
+  }
+
+  /// Composition-only controls (detail, colour, radius) re-applied to the last
+  /// native frame; nil until a native frame has been rendered.
+  public func recomposeLastFrame(outputOptions options: MLXVideoOutputOptions) throws -> MLXVideoFrame? {
+    guard let retained = retainedFrame else { return nil }
+    return MLXVideoFrame(try nativeComposition(for: options, source: retained.source)(retained.stages.postprocessed, source: retained.source))
+  }
+
+  /// The effect intensity re-applied to the last native frame's retained head
+  /// output. Only a frame rendered without temporal history qualifies, because
+  /// the intensity shapes the history of every later frame; nil otherwise.
+  public func reintensifyLastFrame(intensity: Float, outputOptions options: MLXVideoOutputOptions) throws -> MLXVideoFrame? {
+    guard var retained = retainedFrame, !retained.stages.hadHistory else { return nil }
+    guard intensity.isFinite, (0...2).contains(intensity) else {
+      throw MLXMediaError("Native rendering requires an intensity within 0...2")
+    }
+    let stages = retained.stages
+    let output = postprocessor(head: stages.head, currentColor: stages.color, features: stages.features,
+      hasHistory: false, historyConfidence: stages.historyConfidence, controlMask: stages.controlMask,
+      intensity: intensity)
+    history = stopGradient(output)
+    retained.stages = RetainedStages(head: stages.head, features: stages.features, color: stages.color,
+      historyConfidence: stages.historyConfidence, controlMask: stages.controlMask, hadHistory: false,
+      postprocessed: output)
+    retained.intensity = intensity
+    retainedFrame = retained
+    return MLXVideoFrame(try nativeComposition(for: options, source: retained.source)(output, source: retained.source))
+  }
+
+  private func nativeComposition(for options: MLXVideoOutputOptions, source: MLXArray) throws -> MLXVideoComposition {
+    guard source.dim(2) == options.width, source.dim(1) == options.height else {
+      throw MLXMediaError("Native rendering requires matching video output dimensions")
+    }
+    if nativeCompositionOptions != options {
+      nativeComposition = MLXVideoComposition(options: options)
+      nativeCompositionOptions = options
+    }
+    return nativeComposition!
   }
 
   private func renderDevice(_ request: NeuralRenderRequest, evaluateOutput: Bool = true) async throws -> (output: MLXArray, nanoseconds: UInt64) {
@@ -302,15 +371,19 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
         geometry.isIdentity
         ? networkHeadOutput
         : networkHeadOutput[0..., 0..<logicalHeight, 0..<logicalWidth, 0...]
+      let hadHistory = history != nil
       let output = postprocessor(
         head: headOutput,
         currentColor: colorArray,
         features: features,
-        hasHistory: history != nil,
+        hasHistory: hadHistory,
         historyConfidence: confidenceArray,
         controlMask: controlMaskArray,
         intensity: intensity
       )
+      retainedStages = RetainedStages(head: headOutput, features: features, color: colorArray,
+        historyConfidence: confidenceArray, controlMask: controlMaskArray, hadHistory: hadHistory,
+        postprocessed: output)
       if evaluateOutput { eval(output) }
       let executionNanoseconds = nanoseconds(
         in: started.duration(to: ContinuousClock.now)
@@ -421,6 +494,7 @@ public actor MLXNeuralRenderingDeviceTemporalBackend: NeuralRenderBackend {
   private func clearReferenceState() {
     history = nil
     noiseFrameIndex = 0
+    retainedStages = nil
   }
 
   /// Gathers logical temporal features onto the network extent through the

@@ -706,7 +706,10 @@ struct NeuralRenderingGlobalBlock {
   }()
 
   func callAsFunction(_ input: MLXArray) -> MLXArray {
-    if let compiledBody, input.shape[1] * input.shape[2] <= 512 {
+    // The cached graph covers every extent the resident attention serves.
+    if let compiledBody,
+      input.shape[1] * input.shape[2] <= NeuralRenderingStreamedGlobalAttention.residentMaxTokens
+    {
       return compiledBody(input)
     }
     return body(input)

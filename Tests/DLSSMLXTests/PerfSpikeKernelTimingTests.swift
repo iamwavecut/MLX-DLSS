@@ -435,6 +435,7 @@ final class PerfSpikeKernelTimingTests: XCTestCase {
       Ops.fusedOutputResidualEnabled = false
       NeuralRenderingStreamedGlobalAttention.v2Enabled = false
       Ops.vectorizedE4M3Enabled = false
+      NeuralRenderingFusedWindowBlock.shuffleReciprocals = false
       for item in config.split(separator: ",") {
         let kv = item.split(separator: "=").map(String.init)
         guard kv.count == 2 else { continue }
@@ -444,6 +445,7 @@ final class PerfSpikeKernelTimingTests: XCTestCase {
         case "FUSED_OUTPUT_RESIDUAL": Ops.fusedOutputResidualEnabled = kv[1] == "1"
         case "GLOBAL_ATTENTION_V2": NeuralRenderingStreamedGlobalAttention.v2Enabled = kv[1] == "1"
         case "E4M3_VEC": Ops.vectorizedE4M3Enabled = kv[1] == "1"
+        case "WINDOW_SHUFFLE": NeuralRenderingFusedWindowBlock.shuffleReciprocals = kv[1] == "1"
         default: print("perf-spike AB: unknown toggle \(kv[0])")
         }
       }
@@ -755,6 +757,92 @@ final class PerfSpikeKernelTimingTests: XCTestCase {
         report("block1 ffn+residual literal vs fused", b, a)
       default: report("block1 compiled vs eager", compiled(input), eager(input))
       }
+    }
+  }
+
+  // MARK: 19. reciprocal broadcast via simd_shuffle and two-lane norms: exactness + timing
+
+  func testShuffleVariantsAreBitExact() throws {
+    guard enabled else { throw XCTSkip("MLXDLSS_PERF_SPIKE=1") }
+    let saved = NeuralRenderingFusedWindowBlock.shuffleReciprocals
+    defer { NeuralRenderingFusedWindowBlock.shuffleReciprocals = saved }
+    // single-head block
+    for (height, width) in [(37, 53), (544, 960), (1088, 1920)] {
+      let x = (MLXRandom.normal([1, height, width, 32]) * 0.5).asType(.float16)
+      let w1 = (MLXRandom.normal([32, 128]) * 0.1).asType(.float16)
+      let w2 = (MLXRandom.normal([128, 32]) * 0.1).asType(.float16)
+      let cos1 = MLXRandom.uniform(low: 0.5, high: 1.0, [32]).asType(.float16)
+      let qkv = (MLXRandom.normal([32, 96]) * 0.1).asType(.float16)
+      let scale = MLXArray([Float(1.2)]).asType(.float16)
+      let bias = (MLXRandom.normal([1, 64, 64]) * 2.0).asType(.float16)
+      let proj = (MLXRandom.normal([32, 32]) * 0.1).asType(.float16)
+      let cos2 = MLXRandom.uniform(low: 0.5, high: 1.0, [32]).asType(.float16)
+      eval(x, w1, w2, cos1, qkv, scale, bias, proj, cos2)
+      for origin in [NeuralRenderingWindowOrigin.zero, NeuralRenderingWindowOrigin(y: -4, x: -4)] {
+        func run() -> MLXArray {
+          NeuralRenderingFusedWindowBlock.apply(x, expansionWeight: w1, feedForwardProjectionWeight: w2, feedForwardCosine: cos1, qkvWeight: qkv, attentionScale: scale, attentionBias: bias, attentionProjectionWeight: proj, attentionCosine: cos2, windowOrigin: origin, publish: true)
+        }
+        NeuralRenderingFusedWindowBlock.shuffleReciprocals = false
+        let reference = run(); eval(reference)
+        var line = "perf-spike shuffle 1h block \(height)x\(width) origin (\(origin.x),\(origin.y)):"
+        line += String(format: " scratch %.3f ms", ms({ [run()] }))
+        for bits in [1] {
+          NeuralRenderingFusedWindowBlock.shuffleReciprocals = true
+          let candidate = run(); eval(candidate)
+          let delta = abs(reference.asType(.float32) - candidate.asType(.float32)).max().item(Float.self)
+          line += String(format: " | shuffle %.3f ms Δ %g", ms({ [run()] }), delta); _ = bits
+          XCTAssertEqual(delta, 0, "1h block bits \(bits) at \(height)x\(width)")
+        }
+        print(line)
+      }
+    }
+    // multi-head core
+    for (heads, height, width) in [(2, 272, 480), (4, 136, 240), (8, 68, 120), (16, 34, 60), (2, 19, 37)] {
+      let channels = heads * 32
+      let qkv = (MLXRandom.normal([1, height, width, channels * 3]) * 0.5).asType(.float16)
+      let scale = MLXRandom.uniform(low: 0.5, high: 2.0, [heads]).asType(.float16)
+      let bias = (MLXRandom.normal([heads, 64, 64]) * 2.0).asType(.float16)
+      eval(qkv, scale, bias)
+      for origin in [NeuralRenderingWindowOrigin.zero, NeuralRenderingWindowOrigin(y: 0, x: -4)] {
+        func run() -> MLXArray {
+          NeuralRenderingFusedWindowAttention.apply(qkv: qkv, attentionScale: scale, attentionBias: bias, headCount: heads, windowOrigin: origin)
+        }
+        NeuralRenderingFusedWindowBlock.shuffleReciprocals = false
+        let reference = run(); eval(reference)
+        var line = "perf-spike shuffle core \(heads)h \(height)x\(width) origin (\(origin.x),\(origin.y)):"
+        line += String(format: " scratch %.3f ms", ms({ [run()] }))
+        for bits in [1] {
+          NeuralRenderingFusedWindowBlock.shuffleReciprocals = true
+          let candidate = run(); eval(candidate)
+          let delta = abs(reference.asType(.float32) - candidate.asType(.float32)).max().item(Float.self)
+          line += String(format: " | shuffle %.3f ms Δ %g", ms({ [run()] }), delta); _ = bits
+          XCTAssertEqual(delta, 0, "core bits \(bits) \(heads)h at \(height)x\(width)")
+        }
+        print(line)
+      }
+    }
+  }
+
+  // MARK: 20. compiled vs eager global stage at the 1080p token count, one process
+
+  func testGlobalStageCompileAB() throws {
+    guard enabled, let path = ProcessInfo.processInfo.environment["MLXDLSS_LOGICAL_WEIGHTS"] else { throw XCTSkip("MLXDLSS_PERF_SPIKE=1 and MLXDLSS_LOGICAL_WEIGHTS") }
+    let weights = ValidatedWeights(arrays: try loadArrays(url: URL(fileURLWithPath: path), stream: .cpu)).cast(to: .float16)
+    let compiled = try NeuralRenderingGlobalStage(weights: weights, quantizeFFN: false, preciseAttention: true, fusedOperations: true, compileGraph: true)
+    let eager = try NeuralRenderingGlobalStage(weights: weights, quantizeFFN: false, preciseAttention: true, fusedOperations: true, compileGraph: false)
+    for (height, width) in [(12, 16), (17, 30), (20, 32)] {
+      let input = (MLXRandom.normal([1, height, width, 1024]) * 0.5).asType(.float16)
+      eval(input)
+      let a = Device.withDefaultDevice(.gpu) { compiled(input) }
+      let b = Device.withDefaultDevice(.gpu) { eager(input) }
+      eval(a, b)
+      let delta = abs(a.asType(.float32) - b.asType(.float32)).max().item(Float.self)
+      var samples: [(Double, Double)] = []
+      for _ in 0..<4 {
+        samples.append((ms({ [compiled(input)] }, warm: 1, runs: 3), ms({ [eager(input)] }, warm: 1, runs: 3)))
+      }
+      let bestCompiled = samples.map(\.0).min()!, bestEager = samples.map(\.1).min()!
+      print("perf-spike global stage compile \(height * width) tokens: compiled \(String(format: "%.2f", bestCompiled)) ms, eager \(String(format: "%.2f", bestEager)) ms, max |Δ| \(delta)")
     }
   }
 }

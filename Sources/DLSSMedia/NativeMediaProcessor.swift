@@ -109,7 +109,8 @@ public actor NativeMediaProcessor {
     var previousSource: NativeDecodedFrame?
     var previousDisplay: MLXVideoFrame?
 
-    func render(_ source: MLXVideoFrame, prepared: MLXVideoMotion?? = nil, isolation: isolated (any Actor)? = #isolation) async throws -> MLXVideoFrame {
+    func render(_ source: MLXVideoFrame, prepared: MLXVideoMotion?? = nil, scheduled: Bool = false,
+                isolation: isolated (any Actor)? = #isolation) async throws -> MLXVideoFrame {
       guard let renderer else { return source }
       let motion: MLXVideoMotion?
       if let prepared {
@@ -123,10 +124,33 @@ public actor NativeMediaProcessor {
       let renderingStarted = ContinuousClock.now
       let result = try await renderer.renderVideoFrame(source, motion: motion,
         context: NeuralRenderFrameContext(streamID: 1, frameIndex: UInt64(renderIndex)),
-        processingScale: options.processingScale, temporal: options.temporal)
+        processingScale: options.processingScale, temporal: options.temporal, evaluated: !scheduled)
       timing.renderingSeconds += seconds(since: renderingStarted)
       renderIndex += 1
       return result
+    }
+
+    // Generated frames before a rendered frame, then the frame itself, then the
+    // bookkeeping the sequential loop does per input frame.
+    func emitRendered(_ frame: NativeDecodedFrame, _ display: MLXVideoFrame,
+                      isolation: isolated (any Actor)? = #isolation) async throws {
+      if let generator, let previousSource, let previousDisplay {
+        let generationStarted = ContinuousClock.now
+        let intermediates = try await generator.interpolate(previousDisplay, display, factor: factor)
+        timing.generationSeconds += seconds(since: generationStarted)
+        for (index, intermediate) in intermediates.enumerated() {
+          let time = previousSource.time + CMTimeMultiplyByRatio(frame.time - previousSource.time,
+            multiplier: Int32(index + 1), divisor: Int32(factor))
+          try await emit(intermediate, sourceTime: time)
+        }
+      }
+      try await emit(display, sourceTime: frame.time)
+      previousDisplay = display
+      inputFrames += 1
+      lastDuration = frame.duration
+      previousSource = frame
+      await progress(MediaProgress(inputFrames: inputFrames, outputFrames: outputFrames,
+        estimatedInputFrames: reader.estimatedFrames, sceneResets: resets, elapsedSeconds: seconds(since: started)))
     }
 
     func emit(_ frame: MLXVideoFrame, sourceTime: CMTime, isolation: isolated (any Actor)? = #isolation) async throws {
@@ -158,6 +182,8 @@ public actor NativeMediaProcessor {
       let overlap = Self.overlapMotionEnabled && options.order != .generationThenRendering && flow != nil && renderer != nil
       let threshold = options.sceneCutThreshold
       // Motion for `current`, started while the previous frame rendered.
+      // The rendered frame waiting to be encoded while the next one renders.
+      var pendingDisplay: (frame: NativeDecodedFrame, display: MLXVideoFrame)?
       var pendingMotion: Task<(MLXVideoMotion?, Double), any Error>? = overlap ? Task.detached { [flow, rgb = first.rgb] in
         let started = ContinuousClock.now
         let motion = try await flow!.prepare(rgb, index: 0, sceneCutThreshold: threshold)
@@ -171,7 +197,9 @@ public actor NativeMediaProcessor {
         }
         if overlap {
           // Wait for this frame's motion (in order), decode the next frame and
-          // start its motion estimation, then render this frame on the GPU.
+          // start its motion estimation, schedule this frame's rendering on the
+          // GPU, and only then encode the previous frame, so the GPU keeps
+          // working while the encoder and the decoder do their part.
           let (motion, motionSeconds) = try await pendingMotion!.value
           timing.motionSeconds += motionSeconds
           let decodingStarted = ContinuousClock.now
@@ -188,24 +216,11 @@ public actor NativeMediaProcessor {
           } else {
             pendingMotion = nil
           }
-          let display = try await render(frame.rgb, prepared: .some(motion))
-          if let generator, let previousSource, let previousDisplay {
-            let generationStarted = ContinuousClock.now
-            let intermediates = try await generator.interpolate(previousDisplay, display, factor: factor)
-            timing.generationSeconds += seconds(since: generationStarted)
-            for (index, intermediate) in intermediates.enumerated() {
-              let time = previousSource.time + CMTimeMultiplyByRatio(frame.time - previousSource.time,
-                multiplier: Int32(index + 1), divisor: Int32(factor))
-              try await emit(intermediate, sourceTime: time)
-            }
+          let display = try await render(frame.rgb, prepared: .some(motion), scheduled: true)
+          if let pending = pendingDisplay {
+            try await emitRendered(pending.frame, pending.display)
           }
-          try await emit(display, sourceTime: frame.time)
-          previousDisplay = display
-          inputFrames += 1
-          lastDuration = frame.duration
-          previousSource = frame
-          await progress(MediaProgress(inputFrames: inputFrames, outputFrames: outputFrames,
-            estimatedInputFrames: reader.estimatedFrames, sceneResets: resets, elapsedSeconds: seconds(since: started)))
+          pendingDisplay = (frame, display)
           current = next
           continue
         }
@@ -244,6 +259,9 @@ public actor NativeMediaProcessor {
         let decodingStarted = ContinuousClock.now
         current = try await reader.next()
         timing.decodingSeconds += seconds(since: decodingStarted)
+      }
+      if let pending = pendingDisplay {
+        try await emitRendered(pending.frame, pending.display)
       }
       // The final original frame lasts one output interval, matching (N-1)*F+1
       // frames. VFR intervals before it retain their original presentation times.

@@ -20,8 +20,10 @@ public struct MLXPixelBuffer: @unchecked Sendable {
   public var height: Int { CVPixelBufferGetHeight(buffer) }
 }
 
-/// Immutable, evaluated RGB storage. Lazy graphs are completed before crossing an
-/// actor boundary; only the rendering actors build new graphs from this storage.
+/// Immutable RGB storage. Frames are evaluated before crossing an actor boundary,
+/// except frames the video pipeline schedules ahead: their graph is already
+/// submitted and every consumer evaluates before touching the bytes. Only the
+/// rendering actors build new graphs from this storage.
 public final class MLXVideoFrame: @unchecked Sendable {
   let array: MLXArray
   public let width: Int
@@ -31,6 +33,16 @@ public final class MLXVideoFrame: @unchecked Sendable {
     precondition(array.ndim == 4 && array.dim(0) == 1 && array.dim(3) == 3)
     self.array = contiguous(array.asType(.float32))
     eval(self.array)
+    width = array.dim(2)
+    height = array.dim(1)
+  }
+
+  /// A frame whose graph is submitted without waiting for it, so its GPU work can
+  /// overlap the encoding of the previous frame.
+  init(scheduling array: MLXArray) {
+    precondition(array.ndim == 4 && array.dim(0) == 1 && array.dim(3) == 3)
+    self.array = contiguous(array.asType(.float32))
+    asyncEval(self.array)
     width = array.dim(2)
     height = array.dim(1)
   }
@@ -59,7 +71,10 @@ public final class MLXVideoFrame: @unchecked Sendable {
     self.init(rgb)
   }
 
-  public func copyRGBData() -> Data { array.asData(access: .copy).data }
+  public func copyRGBData() -> Data {
+    eval(array)
+    return array.asData(access: .copy).data
+  }
 
   static func storage(_ buffer: CVPixelBuffer, dtype: DType) throws -> MLXArray {
     guard !CVPixelBufferIsPlanar(buffer),

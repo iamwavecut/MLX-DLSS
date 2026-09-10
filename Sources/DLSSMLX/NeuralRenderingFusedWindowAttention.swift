@@ -43,7 +43,7 @@ enum NeuralRenderingFusedWindowAttention {
     source: #"""
       // Threadgroup memory (halfs): K 0..2048, V 2048..4096, 640 of scratch per simdgroup
       // (512 for the query rows / scores, then 16 reciprocals).
-      threadgroup half4 arena4[(4096 + 4 * 640) / 4];
+      threadgroup half4 arena4[(4096 + 4 * (shuffleReciprocals ? 512 : 640)) / 4];
       threadgroup half* arena = (threadgroup half*)arena4;
       threadgroup half* K = arena;
       threadgroup half* V = arena + 2048;
@@ -52,7 +52,7 @@ enum NeuralRenderingFusedWindowAttention {
       const uint simd = simdgroup_index_in_threadgroup;
       const uint lane = thread_index_in_simdgroup;
       const uint tid = thread_position_in_threadgroup.x;
-      threadgroup half* T = arena + 4096 + simd * 640;
+      threadgroup half* T = arena + 4096 + simd * (shuffleReciprocals ? 512 : 640);
       threadgroup half4* T4 = (threadgroup half4*)T;
       threadgroup half* R = T + 512;   // reused: 16 reciprocals (query norm), 8 (softmax)
 
@@ -88,6 +88,7 @@ enum NeuralRenderingFusedWindowAttention {
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         if (part == 1) {
+          half reciprocalNorm = 0.0h;
           if (lane < 16) {
             threadgroup half* vec = T + lane * 32;
             half value[32];
@@ -114,11 +115,16 @@ enum NeuralRenderingFusedWindowAttention {
               }
             }
             half norm = max(xorOne[0][0] + xorOne[0][1], half(0.00006198883056640625));
-            R[lane] = half(metal::fast::rsqrt(float(norm)));
+            reciprocalNorm = half(metal::fast::rsqrt(float(norm)));
+          }
+          if (!shuffleReciprocals) {
+            if (lane < 16) { R[lane] = reciprocalNorm; }
           }
           simdgroup_barrier(mem_flags::mem_threadgroup);
           for (uint i = lane; i < 128; i += 32) {
-            half4 normalized = T4[i] * R[i / 8];
+            const half tokenReciprocal = shuffleReciprocals
+              ? simd_shuffle(reciprocalNorm, i / 8) : R[i / 8];
+            half4 normalized = T4[i] * tokenReciprocal;
             K4[(simd * 16 + i / 8) * 8 + i % 8] = half4(
               half(float(mlxdlss_e4m3(normalized.x))), half(float(mlxdlss_e4m3(normalized.y))),
               half(float(mlxdlss_e4m3(normalized.z))), half(float(mlxdlss_e4m3(normalized.w))));
@@ -144,6 +150,7 @@ enum NeuralRenderingFusedWindowAttention {
         T4[i] = in ? qkv4[((uint(y) * width + uint(x)) * rowStride + head * 32) / 4 + i % 8] : half4(0.0h);
       }
       simdgroup_barrier(mem_flags::mem_threadgroup);
+      half reciprocalNorm = 0.0h;
       if (lane < 16) {
         threadgroup half* vec = T + lane * 32;
         half value[32];
@@ -170,11 +177,16 @@ enum NeuralRenderingFusedWindowAttention {
           }
         }
         half norm = max(xorOne[0][0] + xorOne[0][1], half(0.00006198883056640625));
-        R[lane] = half(metal::fast::rsqrt(float(norm)));
+        reciprocalNorm = half(metal::fast::rsqrt(float(norm)));
+      }
+      if (!shuffleReciprocals) {
+        if (lane < 16) { R[lane] = reciprocalNorm; }
       }
       simdgroup_barrier(mem_flags::mem_threadgroup);
       for (uint i = lane; i < 128; i += 32) {
-        half4 normalized = T4[i] * R[i / 8];
+        const half tokenReciprocal = shuffleReciprocals
+          ? simd_shuffle(reciprocalNorm, i / 8) : R[i / 8];
+        half4 normalized = T4[i] * tokenReciprocal;
         normalized *= scale;
         T4[i] = half4(
           half(float(mlxdlss_e4m3(normalized.x))), half(float(mlxdlss_e4m3(normalized.y))),
@@ -219,6 +231,7 @@ enum NeuralRenderingFusedWindowAttention {
           T4[i] = T4[i] + attentionBias4[(head * 64 + token0 + i / 16) * 16 + i % 16];
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
+        half reciprocalTotal = 0.0h;
         if (lane < 8) {
           threadgroup half* row = S + lane * 64;
           half total = 0.0h;
@@ -233,11 +246,12 @@ enum NeuralRenderingFusedWindowAttention {
             total += weight.x;
             total += weight.y;
           }
-          R[lane] = half(1.0f / float(total));
+          reciprocalTotal = half(1.0f / float(total));
+          if (!shuffleReciprocals) { R[lane] = reciprocalTotal; }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = lane; i < 128; i += 32) {
-          const half reciprocal = R[i / 16];
+          const half reciprocal = shuffleReciprocals ? simd_shuffle(reciprocalTotal, i / 16) : R[i / 16];
           half4 scores = T4[i];
           half4 probabilities;
           for (uint p = 0; p < 2; ++p) {
@@ -324,7 +338,10 @@ enum NeuralRenderingFusedWindowAttention {
       // MLX 0.31 uses constant pointers for inputs smaller than eight elements.
       // Separate the two scale signatures so its cache never evicts a pipeline
       // still referenced by an encoded dispatch with another head count.
-      template: [("constantAttentionScale", headCount < 8)],
+      template: [
+        ("constantAttentionScale", headCount < 8),
+        ("shuffleReciprocals", NeuralRenderingFusedWindowBlock.shuffleReciprocals),
+      ],
       grid: (threadgroups * 32 * simdgroupsPerWindow, 1, 1),
       threadGroup: (32 * simdgroupsPerWindow, 1, 1),
       outputShapes: [[1, height, width, channels]],

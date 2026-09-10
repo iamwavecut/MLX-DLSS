@@ -47,7 +47,33 @@ public actor NativeMediaPreview {
   private var dlssURL: URL?
   private var motionKey: MotionKey?
   private var motions: [MLXVideoMotion?] = []
+  /// The last neural-rendering result and the controls it was rendered with.
+  /// Composition-only controls are re-applied to it, and the intensity too when
+  /// no temporal history is involved; everything else re-renders.
+  private var lastRendering: LastRendering?
   private var busy = false
+
+  private struct LastRendering {
+    let source: SourceKey
+    let options: MediaProcessingOptions   // live controls neutralised
+    let temporal: Bool
+    var intensity: Float
+    var composition: [Float]
+    var result: MLXVideoFrame
+    let historyFrames: Int
+  }
+
+  /// Everything that changes the head input or history, with the live controls
+  /// (intensity, detail, colour, radius) and post-NR upscaling set to fixed values.
+  private static func renderingKey(_ options: MediaProcessingOptions) -> MediaProcessingOptions {
+    var key = options
+    key.intensity = 1
+    key.detailStrength = 1
+    key.colourStrength = 1
+    key.detailRadius = 4
+    key.superResolutionWeights = nil
+    return key
+  }
 
   private struct SourceKey: Equatable {
     let url: URL
@@ -80,6 +106,7 @@ public actor NativeMediaPreview {
       original = nil
       motionKey = nil
       motions = []
+      lastRendering = nil
     }
     guard let selected = frames.last else { throw MLXMediaError("No frame at the selected time") }
     if original == nil { original = try await io.displayImage(selected.rgb) }
@@ -102,10 +129,18 @@ public actor NativeMediaPreview {
           executionMode: .metalFused, computePrecision: options.precision)
         modelURL = url
         precision = options.precision
+        lastRendering = nil
       }
-      await renderer!.reset(sequenceID: 1)
+    } else {
+      lastRendering = nil
     }
-    if options.renderingModel != nil || dlss != nil {
+    let reusable = try await reuseLastRendering(key: key, options: options, temporal: request.isVideo && options.temporal,
+      selected: selected)
+    if let reusable {
+      result = reusable.result
+      historyFrames = reusable.historyFrames
+    } else if options.renderingModel != nil || dlss != nil {
+      if let renderer { await renderer.reset(sequenceID: 1) }
       let temporal = request.isVideo && options.temporal
       if temporal {
         let key = MotionKey(mode: options.motion, threshold: options.sceneCutThreshold)
@@ -138,6 +173,11 @@ public actor NativeMediaPreview {
       }
       try Task.checkCancellation()
       historyFrames = indices.count - 1
+      lastRendering = options.renderingModel != nil && dlss == nil
+        ? LastRendering(source: key, options: Self.renderingKey(options), temporal: temporal, intensity: options.intensity,
+          composition: [options.detailStrength, options.colourStrength, options.detailRadius], result: result,
+          historyFrames: historyFrames)
+        : nil
     }
     if let url = options.superResolutionWeights {
       if upscaler == nil || superResolutionURL != url {
@@ -157,6 +197,37 @@ public actor NativeMediaPreview {
     return MediaPreviewResult(original: original!, processed: processed, time: selected.time.seconds,
       duration: duration, frameInterval: frameInterval, historyFrames: historyFrames,
       elapsedSeconds: Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18)
+  }
+
+  /// Reuses the last neural-rendering result when only live controls changed:
+  /// detail/colour/radius are recomposed, and the intensity is re-applied to the
+  /// retained head output when the frame has no temporal history (a still image
+  /// or a non-temporal preview). Returns nil when the head must run again.
+  private func reuseLastRendering(key: SourceKey, options: MediaProcessingOptions, temporal: Bool,
+                                  selected: NativeDecodedFrame) async throws -> (result: MLXVideoFrame, historyFrames: Int)? {
+    guard options.renderingModel != nil, dlss == nil, let renderer, var last = lastRendering,
+      last.source == key, last.temporal == temporal, last.options == Self.renderingKey(options)
+    else { return nil }
+    let composition = [options.detailStrength, options.colourStrength, options.detailRadius]
+    if last.intensity == options.intensity, last.composition == composition {
+      return (last.result, last.historyFrames)
+    }
+    let outputOptions = try MLXVideoOutputOptions(width: selected.rgb.width, height: selected.rgb.height,
+      detailStrength: options.detailStrength, colourStrength: options.colourStrength, radius: options.detailRadius)
+    let frame: MLXVideoFrame?
+    if last.intensity == options.intensity {
+      frame = try await renderer.recomposeLastFrame(outputOptions: outputOptions)
+    } else if !temporal {
+      frame = try await renderer.reintensifyLastFrame(intensity: options.intensity, outputOptions: outputOptions)
+    } else {
+      frame = nil
+    }
+    guard let frame else { return nil }
+    last.intensity = options.intensity
+    last.composition = composition
+    last.result = frame
+    lastRendering = last
+    return (frame, last.historyFrames)
   }
 
   private func loadSource(_ key: SourceKey) async throws {

@@ -24,6 +24,12 @@ enum NeuralRenderingFusedWindowBlock {
   static let hiddenChannels = 128
   static let windowSize = 8
   static let simdgroupsPerWindow = 4
+  /// Per-token reciprocals (cosine norms, softmax denominators) reach the other
+  /// lanes through `simd_shuffle` instead of threadgroup scratch, which trims the
+  /// window kernels to 12 KB per threadgroup (`MLXDLSS_WINDOW_SHUFFLE=0` restores
+  /// the scratch arrays).
+  nonisolated(unsafe) static var shuffleReciprocals: Bool =
+    ProcessInfo.processInfo.environment["MLXDLSS_WINDOW_SHUFFLE"] != "0"
 
   private static let kernel = MLXFast.metalKernel(
     name: "mlxdlss_fused_window_block_1h32",
@@ -35,7 +41,7 @@ enum NeuralRenderingFusedWindowBlock {
     source: #"""
       // Threadgroup memory (halfs): shared region 0..4096 (weight chunks, then
       // K 0..2048 and V 2048..4096), then 768 halfs of scratch per simdgroup.
-      threadgroup half4 arena4[(4096 + 4 * 768) / 4];
+      threadgroup half4 arena4[(4096 + 4 * (shuffleReciprocals ? 512 : 768)) / 4];
       threadgroup half* arena = (threadgroup half*)arena4;
       threadgroup half* W = arena;
       threadgroup half4* W4 = (threadgroup half4*)W;
@@ -46,7 +52,7 @@ enum NeuralRenderingFusedWindowBlock {
       const uint simd = simdgroup_index_in_threadgroup;
       const uint lane = thread_index_in_simdgroup;
       const uint tid = thread_position_in_threadgroup.x;
-      threadgroup half* T = arena + 4096 + simd * 768;
+      threadgroup half* T = arena + 4096 + simd * (shuffleReciprocals ? 512 : 768);
       threadgroup half4* T4 = (threadgroup half4*)T;
       threadgroup half* R = T + 512;   // 16 per-token reciprocals
 
@@ -191,6 +197,7 @@ enum NeuralRenderingFusedWindowBlock {
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         if (part < 2) {
+          half reciprocalNorm = 0.0h;
           if (lane < 16) {
             threadgroup half* vec = T + lane * 32;
             half value[32];
@@ -217,12 +224,17 @@ enum NeuralRenderingFusedWindowBlock {
               }
             }
             half norm = max(xorOne[0][0] + xorOne[0][1], half(0.00006198883056640625));
-            R[lane] = half(metal::fast::rsqrt(float(norm)));
+            reciprocalNorm = half(metal::fast::rsqrt(float(norm)));
+          }
+          if (!shuffleReciprocals) {
+            if (lane < 16) { R[lane] = reciprocalNorm; }
           }
           simdgroup_barrier(mem_flags::mem_threadgroup);
           for (uint i = lane; i < 128; i += 32) {
             const uint tokenInSimd = i / 8;
-            half4 normalized = T4[i] * R[tokenInSimd];
+            const half tokenReciprocal = shuffleReciprocals
+              ? simd_shuffle(reciprocalNorm, tokenInSimd) : R[tokenInSimd];
+            half4 normalized = T4[i] * tokenReciprocal;
             if (part == 0) { normalized *= scale; }
             half4 value = half4(
               half(float(mlxdlss_e4m3(normalized.x))), half(float(mlxdlss_e4m3(normalized.y))),
@@ -284,6 +296,7 @@ enum NeuralRenderingFusedWindowBlock {
           T4[i] = T4[i] + attentionBias4[(token0 + i / 16) * 16 + i % 16];
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
+        half reciprocalTotal = 0.0h;
         if (lane < 8) {
           threadgroup half* row = S + lane * 64;
           half total = 0.0h;
@@ -298,11 +311,12 @@ enum NeuralRenderingFusedWindowBlock {
             total += weight.x;
             total += weight.y;
           }
-          R[lane] = half(1.0f / float(total));
+          reciprocalTotal = half(1.0f / float(total));
+          if (!shuffleReciprocals) { R[lane] = reciprocalTotal; }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = lane; i < 128; i += 32) {
-          const half reciprocal = R[i / 16];
+          const half reciprocal = shuffleReciprocals ? simd_shuffle(reciprocalTotal, i / 16) : R[i / 16];
           half4 scores = T4[i];
           half4 probabilities;
           for (uint p = 0; p < 2; ++p) {
@@ -430,6 +444,7 @@ enum NeuralRenderingFusedWindowBlock {
     let params = NeuralRenderingKernelParameters.array([UInt32(height), UInt32(width), UInt32(padTop), UInt32(padLeft), publish ? UInt32(1) : UInt32(0)])
     return kernel(
       inputs + [params],
+      template: [("shuffleReciprocals", shuffleReciprocals)],
       grid: (windowCount * 32 * simdgroupsPerWindow, 1, 1),
       threadGroup: (32 * simdgroupsPerWindow, 1, 1),
       outputShapes: [input.shape],
