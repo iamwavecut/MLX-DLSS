@@ -1,6 +1,13 @@
 import Foundation
 import DLSSMLX
 
+// macOS kills GPU command buffers that block display compositing
+// ("Impacting Interactivity", IOGPU 0xe) while the display is active. MLX cannot
+// catch that from the Metal completion thread, so relax the driver's context-store
+// timeout before the first Metal device is created (the workaround recommended in
+// ml-explore/mlx#3267); an explicit value in the environment is respected.
+setenv("AGX_RELAX_CDM_CTXSTORE_TIMEOUT", "1", 0)
+
 enum CLIError: Error, Sendable {
     case usage(String)
     case missingOutput(String)

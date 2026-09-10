@@ -685,4 +685,76 @@ final class PerfSpikeKernelTimingTests: XCTestCase {
       }
     }
   }
+
+  // MARK: 18. float32 probes for the compiled (tile-kernel) feed-forward path, one stage per process
+
+  func testFloat32CompiledProbe() throws {
+    guard let probe = ProcessInfo.processInfo.environment["MLXDLSS_PROBE"] else { throw XCTSkip("MLXDLSS_PROBE=ffn:ROWS | block:H:W (needs MLXDLSS_LOGICAL_WEIGHTS for block)") }
+    typealias Ops = NeuralRenderingTransformerOperations
+    let fields = probe.split(separator: ":").map(String.init)
+    if fields[0] == "ffn" {
+      let rows = Int(fields[1])!
+      let dtype: DType = fields.count > 2 && fields[2] == "half" ? .float16 : .float32
+      let input = MLXArray((0..<(rows * 32)).map { sin(Float($0) * 0.001) }, [1, rows / 8, 8, 32]).asType(dtype)
+      let expansion = MLXArray((0..<(32 * 128)).map { cos(Float($0) * 0.003) * 0.05 }, [32, 128]).asType(dtype)
+      let projection = MLXArray((0..<(128 * 32)).map { sin(Float($0) * 0.005) * 0.05 }, [128, 32]).asType(dtype)
+      eval(input, expansion, projection)
+      let expected = matmul(Ops.e4m3RoundTrip(Ops.quadraticGateActivation(matmul(input, expansion))), projection)
+      eval(expected)
+      let actual = Ops.fusedSimpleFeedForward(input, expansionWeight: expansion, projectionWeight: projection)
+      eval(actual)
+      let delta = abs(actual.asType(.float32) - expected.asType(.float32))
+      let maxDelta = delta.max().item(Float.self)
+      let count = (delta .> 0.001).sum().item(Int32.self)
+      let firstBad = argMax(delta.flattened()).item(Int32.self)
+      print("perf-spike probe ffn rows=\(rows) \(dtype): max |Δ| \(maxDelta), \(count) elements > 1e-3, first at flat index \(firstBad) (row \(Int(firstBad) / 32))")
+    } else {
+      guard let path = ProcessInfo.processInfo.environment["MLXDLSS_LOGICAL_WEIGHTS"] else { throw XCTSkip("needs weights") }
+      let height = Int(fields[1])!, width = Int(fields[2])!
+      let mode = fields.count > 3 ? fields[3] : "compare"
+      let weights = ValidatedWeights(arrays: try loadArrays(url: URL(fileURLWithPath: path), stream: .cpu))
+      let input = MLXArray((0..<(height * width * 32)).map { sin(Float($0) * 0.001) }, [1, height, width, 32])
+      eval(input)
+      func report(_ label: String, _ a: MLXArray, _ b: MLXArray) {
+        eval(a, b)
+        let delta = abs(a - b)
+        let maxDelta = delta.max().item(Float.self)
+        let count = (delta .> 0.001).sum().item(Int32.self)
+        let where_ = argMax(delta.flattened()).item(Int32.self)
+        print("perf-spike probe \(label) \(height)x\(width) float32: max |Δ| \(maxDelta), \(count) elements > 1e-3, worst flat index \(where_) (pixel \(Int(where_) / 32), channel \(Int(where_) % 32)); |a| max \(abs(a).max().item(Float.self))")
+      }
+      if fields[0] == "seq" || fields[0] == "seqsep" {
+        // Replicates testExternalRecoveredCompiledWindowSequenceMatchesEagerBlocks exactly.
+        let eagerBlocks = try (1...3).map { try NeuralRenderingWindowBlock(weights: weights, blockIndex: $0, channels: 32, hiddenChannels: 128, headCount: 1) }
+        let sequence = try NeuralRenderingWindowSequence(weights: weights, blockIndices: 1...3, channels: 32, hiddenChannels: 128, headCount: 1, compileSequence: true)
+        let reference = eagerBlocks.reduce(input) { value, block in block(value) }
+        let candidate = sequence(input)
+        if fields[0] == "seqsep" { eval(reference); eval(candidate) } else { eval(reference, candidate) }
+        report("sequence 1-3 compiled vs eager (\(fields[0]))", candidate, reference)
+        return
+      }
+      if fields[0] == "ffnreal" {
+        let w1 = try weights.required("block1.layer0.weight1"), w2 = try weights.required("block1.layer0.weight2")
+        typealias Ops = NeuralRenderingTransformerOperations
+        let literal = matmul(Ops.e4m3RoundTrip(Ops.quadraticGateActivation(matmul(input, w1))), w2)
+        let fused = Ops.fusedSimpleFeedForward(input, expansionWeight: w1, projectionWeight: w2)
+        report("ffn real weights fused vs literal", fused, literal)
+        return
+      }
+      let eager = try NeuralRenderingWindowBlock(weights: weights, blockIndex: 1, channels: 32, hiddenChannels: 128, headCount: 1)
+      let compiled = try NeuralRenderingWindowBlock(weights: weights, blockIndex: 1, channels: 32, hiddenChannels: 128, headCount: 1, compileBlock: true)
+      switch mode {
+      case "eager2": report("block1 eager vs eager", eager(input), eager(input))
+      case "compiled2": report("block1 compiled vs compiled", compiled(input), compiled(input))
+      case "ffnonly":
+        typealias Ops = NeuralRenderingTransformerOperations
+        let w1 = try weights.required("block1.layer0.weight1"), w2 = try weights.required("block1.layer0.weight2")
+        let cos = try weights.required("block1.layer0.ffn_cos_skip")
+        let a = Ops.cosineResidual(skip: input, branch: matmul(Ops.e4m3RoundTrip(Ops.quadraticGateActivation(matmul(input, w1))), w2), cosine: cos)
+        let b = Ops.cosineResidual(skip: input, branch: Ops.fusedSimpleFeedForward(input, expansionWeight: w1, projectionWeight: w2), cosine: cos)
+        report("block1 ffn+residual literal vs fused", b, a)
+      default: report("block1 compiled vs eager", compiled(input), eager(input))
+      }
+    }
+  }
 }

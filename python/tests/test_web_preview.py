@@ -37,6 +37,43 @@ print(json.dumps({'output': sys.argv[2]}))
             self.assertEqual({report[2] for report in reports}, {1, 2})
             self.assertEqual(target.read_bytes(), b"rendered")
 
+    def test_retries_once_after_gpu_watchdog_kill_and_passes_driver_hint(self):
+        from mlxdlss.web.native import WATCHDOG_SIGNATURE, run_media
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "result.mp4"
+            script = f"""import json, os, sys
+from pathlib import Path
+marker = Path(sys.argv[2]).parent.parent / "attempt"
+if not marker.exists():
+    marker.write_bytes(b"1")
+    print("[METAL] Command buffer execution failed: Impacting Interactivity (0000000e:{WATCHDOG_SIGNATURE})", file=sys.stderr, flush=True)
+    sys.exit(134)
+Path(sys.argv[2]).write_bytes(b"rendered")
+print(json.dumps({{"output": sys.argv[2], "hint": os.environ.get("AGX_RELAX_CDM_CTXSTORE_TIMEOUT")}}))
+"""
+            reports = []
+            result = run_media([sys.executable, "-c", script, "--output", str(target)],
+                               lambda *values: reports.append(values), lambda: False)
+            self.assertEqual(target.read_bytes(), b"rendered")
+            self.assertEqual(result["hint"], "1")
+            self.assertTrue(any("retrying" in report[0] for report in reports))
+
+    def test_other_failures_are_not_retried(self):
+        from mlxdlss.web.native import run_media
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "result.mp4"
+            script = """import sys
+from pathlib import Path
+counter = Path(sys.argv[2]).parent.parent / "attempts"
+counter.write_bytes(counter.read_bytes() + b"x" if counter.exists() else b"x")
+print("usage error: something else", file=sys.stderr, flush=True)
+sys.exit(2)
+"""
+            with self.assertRaises(RuntimeError):
+                run_media([sys.executable, "-c", script, "--output", str(target)], lambda *_: None, lambda: False)
+            self.assertEqual((Path(directory) / "attempts").read_bytes(), b"x")
+            self.assertFalse(target.exists())
+
     def test_cancel_reaps_child_and_discards_private_partial_files(self):
         from mlxdlss.web.native import run_media
         from mlxdlss.web.runners import Cancelled

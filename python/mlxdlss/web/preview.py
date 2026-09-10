@@ -104,7 +104,8 @@ class PreviewSession:
             self._stop_process()
             self.errors = tempfile.TemporaryFile()
             self.process = subprocess.Popen([binary, "preview-stream"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                            stderr=self.errors, text=True, bufsize=1)
+                                            stderr=self.errors, text=True, bufsize=1,
+                                            env=native.child_environment())
             self.process_key = binary
         process = self.process
         if self.closed.is_set():

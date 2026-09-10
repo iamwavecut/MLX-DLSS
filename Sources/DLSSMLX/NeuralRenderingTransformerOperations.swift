@@ -2328,7 +2328,9 @@ enum NeuralRenderingTransformerOperations {
     precondition(outputChannels.isMultiple(of: 8))
     precondition(expansionWeight.shape == [inputChannels, hiddenChannels])
     precondition(projectionWeight.shape == [hiddenChannels, outputChannels])
-    let dataType = expansionWeight.dtype
+    // The tile kernels run in the activation dtype: float32 graphs with half
+    // weights promote like the literal matmuls instead of dropping to half.
+    let dataType = input.dtype
     precondition(maximumIntermediateBytes > 0)
     let rowsPerChunk = max(
       8,
@@ -2368,7 +2370,9 @@ enum NeuralRenderingTransformerOperations {
     let hiddenChannels = expansionWeight.shape[1]
     let outputChannels = projectionWeight.shape[1]
     let rowCount = input.size / inputChannels
-    let dataType = expansionWeight.dtype
+    let dataType = input.dtype
+    let expansionWeight = expansionWeight.asType(dataType)
+    let projectionWeight = projectionWeight.asType(dataType)
     let expansionTileCount = rowCount / 8 * hiddenChannels / 8
     let expansionDispatch = fusedDispatchGrid(tileCount: expansionTileCount)
     let activated = feedForwardExpansionGateKernel(
@@ -2463,7 +2467,9 @@ enum NeuralRenderingTransformerOperations {
     )
     precondition(branchProjectionWeight.shape == [groupCount, 4, 32, 32])
     precondition(outputProjectionWeight.shape == [channels, channels])
-    let dataType = expansionWeight.dtype
+    let dataType = input.dtype
+    let expansionWeight = expansionWeight.asType(dataType)
+    let branchProjectionWeight = branchProjectionWeight.asType(dataType)
     let expandedShape = [rowCount, groupCount, 4, 32]
     let expansionTileCount = rowCount / 8 * groupCount * 16
     let expansionDispatch = fusedDispatchGrid(tileCount: expansionTileCount)
@@ -2542,9 +2548,13 @@ enum NeuralRenderingTransformerOperations {
     header: e4m3MetalHeader
   )
 
-  /// `e4m3RoundTrip(quadraticGateActivation(input))` in one pass (half4 lanes).
+  /// `e4m3RoundTrip(quadraticGateActivation(input))`: one pass (half4 lanes) for
+  /// half tensors, the per-operation chain for every other dtype (float32 graphs
+  /// keep their float activations instead of trapping).
   static func quadraticGatePublish(_ input: MLXArray) -> MLXArray {
-    precondition(input.dtype == .float16 && input.size.isMultiple(of: 4))
+    guard input.dtype == .float16, input.size.isMultiple(of: 4) else {
+      return e4m3RoundTrip(quadraticGateActivation(input))
+    }
     let count = input.size / 4
     return quadraticGatePublishKernel(
       [input, NeuralRenderingKernelParameters.array([UInt32(count)])],

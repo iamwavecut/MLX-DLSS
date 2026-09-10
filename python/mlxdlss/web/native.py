@@ -73,6 +73,18 @@ def video_arguments(source, target, effects, settings, output: OutputOptions) ->
     return args
 
 
+# macOS's GPU watchdog kills command buffers that block display compositing while
+# the display is active (IOGPU "Impacting Interactivity"); MLX cannot catch that,
+# so the child process dies. The driver hint below is the workaround recommended
+# in ml-explore/mlx#3267, and one retry covers the remaining kills.
+WATCHDOG_ENVIRONMENT = {"AGX_RELAX_CDM_CTXSTORE_TIMEOUT": "1"}
+WATCHDOG_SIGNATURE = "kIOGPUCommandBufferCallbackErrorImpactingInteractivity"
+
+
+def child_environment(**overrides) -> dict:
+    return {**WATCHDOG_ENVIRONMENT, **os.environ, **overrides}
+
+
 def run_media(command, report, should_stop) -> dict:
     from .runners import Cancelled
 
@@ -86,7 +98,14 @@ def run_media(command, report, should_stop) -> dict:
         pending = Path(directory) / target.name
         args = list(command)
         args[output_index] = str(pending)
-        result = _run(args, report, should_stop, {**os.environ, "TMPDIR": directory})
+        environment = child_environment(TMPDIR=directory)
+        try:
+            result = _run(args, report, should_stop, environment)
+        except RuntimeError as error:
+            if WATCHDOG_SIGNATURE not in str(error) or should_stop():
+                raise
+            report("GPU watchdog interrupted the job, retrying once", 0.0, 0, 0)
+            result = _run(args, report, should_stop, environment)
         if should_stop():
             raise Cancelled()
         os.link(pending, target)

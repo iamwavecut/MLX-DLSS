@@ -27,6 +27,9 @@ cat > "$APP_PATH/Contents/Info.plist" <<'PLIST'
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>LSEnvironment</key><dict>
+    <key>AGX_RELAX_CDM_CTXSTORE_TIMEOUT</key><string>1</string>
+  </dict>
   <key>CFBundleDocumentTypes</key><array><dict>
     <key>CFBundleTypeName</key><string>Images and Video</string>
     <key>CFBundleTypeRole</key><string>Viewer</string>
