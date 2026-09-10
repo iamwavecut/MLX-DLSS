@@ -7,10 +7,10 @@ import Foundation
 /// time so that temporal state and MLX lazy graph construction cannot interleave.
 public actor NativeMediaProcessor {
   private var busy = false
-  /// Perf spike: `MLXDLSS_OVERLAP_MOTION=1` estimates the next frame's motion
-  /// while the current frame renders (rendering-then-generation order only).
+  /// The next frame's motion is estimated while the current frame renders
+  /// (rendering-then-generation order); `MLXDLSS_OVERLAP_MOTION=0` serialises them.
   nonisolated(unsafe) static var overlapMotionEnabled: Bool =
-    ProcessInfo.processInfo.environment["MLXDLSS_OVERLAP_MOTION"] == "1"
+    ProcessInfo.processInfo.environment["MLXDLSS_OVERLAP_MOTION"] != "0"
   public init() {}
 
   public func processImage(input: URL, output: URL, options: MediaProcessingOptions) async throws -> MediaProcessingResult {

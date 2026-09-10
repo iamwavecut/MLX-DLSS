@@ -6,15 +6,17 @@ import MLX
 /// probabilities without allocating quadratic score/probability arrays.
 enum NeuralRenderingStreamedGlobalAttention {
   private static let mode = ProcessInfo.processInfo.environment["MLXDLSS_STREAMED_GLOBAL_ATTENTION"]
-  /// Perf spike: `MLXDLSS_GLOBAL_ATTENTION_V2=1` converts scores to vendor
-  /// weights and probabilities with every thread, keeping only the half
-  /// denominator sum sequential; the resident tile then serves up to 1024 tokens.
+  /// The v2 kernels convert scores to vendor weights and probabilities with
+  /// every thread and keep only the half denominator sum sequential, so the
+  /// resident tile serves up to 1024 tokens; `MLXDLSS_GLOBAL_ATTENTION_V2=0`
+  /// restores the earlier kernels and their 512-token limit (diagnostics).
   nonisolated(unsafe) static var v2Enabled: Bool =
-    ProcessInfo.processInfo.environment["MLXDLSS_GLOBAL_ATTENTION_V2"] == "1"
+    ProcessInfo.processInfo.environment["MLXDLSS_GLOBAL_ATTENTION_V2"] != "0"
   static var residentMaxTokens: Int { v2Enabled ? 1024 : 512 }
 
+  /// Longer sequences keep the materialized attention unless streaming is forced.
   static func isEnabled(tokens: Int) -> Bool {
-    mode == "1" || (mode != "0" && (v2Enabled || tokens <= 512))
+    mode == "1" || (mode != "0" && tokens <= residentMaxTokens)
   }
 
   static func apply(query: MLXArray, key: MLXArray, value: MLXArray) -> MLXArray {
@@ -230,7 +232,7 @@ enum NeuralRenderingStreamedGlobalAttention {
       }
       """#, header: header)
 
-  // MARK: - v2 (perf spike)
+  // MARK: - v2
 
   static func applyV2(query: MLXArray, key: MLXArray, value: MLXArray) -> MLXArray {
     let tokens = query.dim(2)

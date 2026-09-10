@@ -4,8 +4,10 @@ import XCTest
 
 @testable import DLSSMLX
 
-/// THROWAWAY perf-spike diagnostics (2026-09-10). Opt-in: `MLXDLSS_PERF_SPIKE=1`.
-/// Prints kernel-level timings of the fused float16 path; nothing here is a gate.
+/// Opt-in performance diagnostics of the fused float16 path (`MLXDLSS_PERF_SPIKE=1`,
+/// most cases also need `MLXDLSS_LOGICAL_WEIGHTS`): kernel timings, exactness of the
+/// optional paths against the per-operation chains, and whole-frame A/B of the
+/// runtime toggles. The exactness cases assert; the timings are diagnostics.
 final class PerfSpikeKernelTimingTests: XCTestCase {
   private var enabled: Bool { ProcessInfo.processInfo.environment["MLXDLSS_PERF_SPIKE"] == "1" }
 
@@ -421,7 +423,9 @@ final class PerfSpikeKernelTimingTests: XCTestCase {
     guard enabled, let path = ProcessInfo.processInfo.environment["MLXDLSS_LOGICAL_WEIGHTS"] else { throw XCTSkip("MLXDLSS_PERF_SPIKE=1 and MLXDLSS_LOGICAL_WEIGHTS") }
     typealias Ops = NeuralRenderingTransformerOperations
     let env = ProcessInfo.processInfo.environment
-    let configs = (env["MLXDLSS_PERF_AB"] ?? "baseline;GLOBAL_EVAL=0").split(separator: ";").map(String.init)
+    // "baseline" is the pre-toggle behaviour (per-block global eval, float E4M3 path
+    // aside, no fused head/residual, v1 global attention); list the toggles to enable.
+    let configs = (env["MLXDLSS_PERF_AB"] ?? "baseline;GLOBAL_EVAL=0,GLOBAL_ATTENTION_V2=1,FUSED_HEAD=1,FUSED_OUTPUT_RESIDUAL=1,E4M3_VEC=1").split(separator: ";").map(String.init)
     let rounds = Int(env["MLXDLSS_PERF_ROUNDS"] ?? "3") ?? 3
     let shapes = (env["MLXDLSS_PERF_SHAPES"] ?? "768x1024,1088x1920").split(separator: ",").map { $0.split(separator: "x").compactMap { Int($0) } }
     let weights = ValidatedWeights(arrays: try loadArrays(url: URL(fileURLWithPath: path), stream: .cpu)).cast(to: .float16)
@@ -430,10 +434,6 @@ final class PerfSpikeKernelTimingTests: XCTestCase {
       NeuralRenderingPostBlock.fusedHeadEnabled = false
       Ops.fusedOutputResidualEnabled = false
       NeuralRenderingStreamedGlobalAttention.v2Enabled = false
-      Ops.fusedGroupedProjectionEnabled = false
-      NeuralRenderingFusedWindowAttention.softmaxV2Enabled = false
-      NeuralRenderingFusedWindowAttention.kernelV3Enabled = false
-      Ops.groupedExpansionEnabled = false
       Ops.vectorizedE4M3Enabled = false
       for item in config.split(separator: ",") {
         let kv = item.split(separator: "=").map(String.init)
@@ -443,10 +443,6 @@ final class PerfSpikeKernelTimingTests: XCTestCase {
         case "FUSED_HEAD": NeuralRenderingPostBlock.fusedHeadEnabled = kv[1] == "1"
         case "FUSED_OUTPUT_RESIDUAL": Ops.fusedOutputResidualEnabled = kv[1] == "1"
         case "GLOBAL_ATTENTION_V2": NeuralRenderingStreamedGlobalAttention.v2Enabled = kv[1] == "1"
-        case "FUSED_GROUPED_PROJECTION": Ops.fusedGroupedProjectionEnabled = kv[1] == "1"
-        case "WINDOW_SOFTMAX_V2": NeuralRenderingFusedWindowAttention.softmaxV2Enabled = kv[1] == "1"
-        case "WINDOW_KERNEL_V3": NeuralRenderingFusedWindowAttention.kernelV3Enabled = kv[1] == "1"
-        case "GROUPED_EXPANSION": Ops.groupedExpansionEnabled = kv[1] == "1"
         case "E4M3_VEC": Ops.vectorizedE4M3Enabled = kv[1] == "1"
         default: print("perf-spike AB: unknown toggle \(kv[0])")
         }
@@ -486,86 +482,6 @@ final class PerfSpikeKernelTimingTests: XCTestCase {
         let ordered = results[key]!
         let samples = ordered.sorted()
         print("perf-spike AB \(key): min \(String(format: "%.1f", samples[0])) ms, median \(String(format: "%.1f", samples[samples.count / 2])) ms, in order \(ordered.map { String(format: "%.0f", $0) }), checksum \(checksums[key]!)")
-      }
-    }
-  }
-
-  // MARK: 11. stage 2/3: fused grouped projection and window softmax v2
-
-  func testGateGroupedProjectionIsBitExact() throws {
-    guard enabled else { throw XCTSkip("MLXDLSS_PERF_SPIKE=1") }
-    typealias Ops = NeuralRenderingTransformerOperations
-    for (groups, rows) in [(2, 130560), (4, 32640), (8, 8160), (8, 8), (2, 24), (4, 40)] {
-      let expanded = (MLXRandom.normal([rows, groups * 128]) * 1.5).asType(.float16)
-      let grouped = (MLXRandom.normal([groups, 128, 32]) * 0.08).asType(.float16)
-      eval(expanded, grouped)
-      let reference = Ops.e4m3RoundTrip(
-        matmul(Ops.quadraticGatePublish(expanded).reshaped([rows, groups, 128]).transposed(1, 0, 2), grouped)
-          .transposed(1, 0, 2).reshaped([rows, groups * 32]))
-      let fused = Ops.gateGroupedProjection(expanded, groupedWeight: grouped)
-      eval(reference, fused)
-      let delta = abs(reference.asType(.float32) - fused.asType(.float32))
-      let maxDelta = delta.max().item(Float.self)
-      let count = (delta .> 0).sum().item(Int32.self)
-      let tr = ms({ [Ops.e4m3RoundTrip(matmul(Ops.quadraticGatePublish(expanded).reshaped([rows, groups, 128]).transposed(1, 0, 2), grouped).transposed(1, 0, 2).reshaped([rows, groups * 32]))] })
-      let tf = ms({ [Ops.gateGroupedProjection(expanded, groupedWeight: grouped)] })
-      print("perf-spike gate+grouped projection G=\(groups) rows=\(rows): max |Δ| \(maxDelta) (\(count) elements differ); reference chain \(String(format: "%.3f", tr)) ms, fused \(String(format: "%.3f", tf)) ms")
-      XCTAssertEqual(maxDelta, 0)
-    }
-  }
-
-  func testWindowSoftmaxV2IsBitExact() throws {
-    guard enabled else { throw XCTSkip("MLXDLSS_PERF_SPIKE=1") }
-    let saved = NeuralRenderingFusedWindowAttention.softmaxV2Enabled
-    defer { NeuralRenderingFusedWindowAttention.softmaxV2Enabled = saved }
-    for (heads, height, width) in [(2, 272, 480), (4, 136, 240), (8, 68, 120), (16, 34, 60), (2, 19, 37), (8, 11, 21)] {
-      let channels = heads * 32
-      let qkv = (MLXRandom.normal([1, height, width, channels * 3]) * 0.5).asType(.float16)
-      let scale = MLXRandom.uniform(low: 0.5, high: 2.0, [heads]).asType(.float16)
-      let bias = (MLXRandom.normal([heads, 64, 64]) * 2.0).asType(.float16)
-      eval(qkv, scale, bias)
-      for origin in [NeuralRenderingWindowOrigin.zero, NeuralRenderingWindowOrigin(y: -4, x: -4)] {
-        NeuralRenderingFusedWindowAttention.softmaxV2Enabled = false
-        let v1 = NeuralRenderingFusedWindowAttention.apply(qkv: qkv, attentionScale: scale, attentionBias: bias, headCount: heads, windowOrigin: origin)
-        NeuralRenderingFusedWindowAttention.softmaxV2Enabled = true
-        let v2 = NeuralRenderingFusedWindowAttention.apply(qkv: qkv, attentionScale: scale, attentionBias: bias, headCount: heads, windowOrigin: origin)
-        eval(v1, v2)
-        let delta = abs(v1.asType(.float32) - v2.asType(.float32)).max().item(Float.self)
-        NeuralRenderingFusedWindowAttention.softmaxV2Enabled = false
-        let t1 = ms({ [NeuralRenderingFusedWindowAttention.apply(qkv: qkv, attentionScale: scale, attentionBias: bias, headCount: heads, windowOrigin: origin)] })
-        NeuralRenderingFusedWindowAttention.softmaxV2Enabled = true
-        let t2 = ms({ [NeuralRenderingFusedWindowAttention.apply(qkv: qkv, attentionScale: scale, attentionBias: bias, headCount: heads, windowOrigin: origin)] })
-        print("perf-spike window softmax v2 \(heads)h \(height)x\(width) origin (\(origin.x),\(origin.y)): max |Δ| \(delta); v1 \(String(format: "%.3f", t1)) ms, v2 \(String(format: "%.3f", t2)) ms")
-        XCTAssertEqual(delta, 0)
-      }
-    }
-    for (height, width) in [(544, 960), (1088, 1920), (37, 53)] {
-      let x = (MLXRandom.normal([1, height, width, 32]) * 0.5).asType(.float16)
-      let w1 = (MLXRandom.normal([32, 128]) * 0.1).asType(.float16)
-      let w2 = (MLXRandom.normal([128, 32]) * 0.1).asType(.float16)
-      let cos1 = MLXRandom.uniform(low: 0.5, high: 1.0, [32]).asType(.float16)
-      let qkv = (MLXRandom.normal([32, 96]) * 0.1).asType(.float16)
-      let scale = MLXArray([Float(1.2)]).asType(.float16)
-      let bias = (MLXRandom.normal([1, 64, 64]) * 2.0).asType(.float16)
-      let proj = (MLXRandom.normal([32, 32]) * 0.1).asType(.float16)
-      let cos2 = MLXRandom.uniform(low: 0.5, high: 1.0, [32]).asType(.float16)
-      eval(x, w1, w2, cos1, qkv, scale, bias, proj, cos2)
-      for origin in [NeuralRenderingWindowOrigin.zero, NeuralRenderingWindowOrigin(y: 0, x: -4)] {
-        func run() -> MLXArray {
-          NeuralRenderingFusedWindowBlock.apply(x, expansionWeight: w1, feedForwardProjectionWeight: w2, feedForwardCosine: cos1, qkvWeight: qkv, attentionScale: scale, attentionBias: bias, attentionProjectionWeight: proj, attentionCosine: cos2, windowOrigin: origin, publish: true)
-        }
-        NeuralRenderingFusedWindowAttention.softmaxV2Enabled = false
-        let v1 = run()
-        NeuralRenderingFusedWindowAttention.softmaxV2Enabled = true
-        let v2 = run()
-        eval(v1, v2)
-        let delta = abs(v1.asType(.float32) - v2.asType(.float32)).max().item(Float.self)
-        NeuralRenderingFusedWindowAttention.softmaxV2Enabled = false
-        let t1 = ms({ [run()] })
-        NeuralRenderingFusedWindowAttention.softmaxV2Enabled = true
-        let t2 = ms({ [run()] })
-        print("perf-spike 1h block softmax v2 \(height)x\(width) origin (\(origin.x),\(origin.y)): max |Δ| \(delta); v1 \(String(format: "%.3f", t1)) ms, v2 \(String(format: "%.3f", t2)) ms")
-        XCTAssertEqual(delta, 0)
       }
     }
   }
@@ -615,99 +531,6 @@ final class PerfSpikeKernelTimingTests: XCTestCase {
       let count = (delta .> 0).sum().item(Int32.self)
       let bitsEqual = (outputs[0].view(dtype: .uint32) .== outputs[1].view(dtype: .uint32)).all().item(Bool.self)
       print("perf-spike mixed MMA scale \(scale) depth \(depth): max |Δ| \(maxDelta), \(count) elements differ, bit-identical \(bitsEqual)")
-    }
-  }
-
-  // MARK: 13. v3 kernels and grouped expansion: exactness + timing
-
-  func testWindowKernelV3IsBitExact() throws {
-    guard enabled else { throw XCTSkip("MLXDLSS_PERF_SPIKE=1") }
-    let saved = NeuralRenderingFusedWindowAttention.kernelV3Enabled
-    defer { NeuralRenderingFusedWindowAttention.kernelV3Enabled = saved }
-    NeuralRenderingFusedWindowAttention.softmaxV2Enabled = false
-    for (heads, height, width) in [(2, 272, 480), (4, 136, 240), (8, 68, 120), (16, 34, 60), (2, 19, 37), (8, 11, 21)] {
-      let channels = heads * 32
-      let qkv = (MLXRandom.normal([1, height, width, channels * 3]) * 0.5).asType(.float16)
-      let scale = MLXRandom.uniform(low: 0.5, high: 2.0, [heads]).asType(.float16)
-      let bias = (MLXRandom.normal([heads, 64, 64]) * 2.0).asType(.float16)
-      eval(qkv, scale, bias)
-      for origin in [NeuralRenderingWindowOrigin.zero, NeuralRenderingWindowOrigin(y: -4, x: -4), NeuralRenderingWindowOrigin(y: 0, x: -4)] {
-        NeuralRenderingFusedWindowAttention.kernelV3Enabled = false
-        let v1 = NeuralRenderingFusedWindowAttention.apply(qkv: qkv, attentionScale: scale, attentionBias: bias, headCount: heads, windowOrigin: origin)
-        NeuralRenderingFusedWindowAttention.kernelV3Enabled = true
-        let v3 = NeuralRenderingFusedWindowAttention.apply(qkv: qkv, attentionScale: scale, attentionBias: bias, headCount: heads, windowOrigin: origin)
-        eval(v1, v3)
-        let delta = abs(v1.asType(.float32) - v3.asType(.float32)).max().item(Float.self)
-        NeuralRenderingFusedWindowAttention.kernelV3Enabled = false
-        let t1 = ms({ [NeuralRenderingFusedWindowAttention.apply(qkv: qkv, attentionScale: scale, attentionBias: bias, headCount: heads, windowOrigin: origin)] })
-        NeuralRenderingFusedWindowAttention.kernelV3Enabled = true
-        let t3 = ms({ [NeuralRenderingFusedWindowAttention.apply(qkv: qkv, attentionScale: scale, attentionBias: bias, headCount: heads, windowOrigin: origin)] })
-        print("perf-spike window core v3 \(heads)h \(height)x\(width) origin (\(origin.x),\(origin.y)): max |Δ| \(delta); v1 \(String(format: "%.3f", t1)) ms, v3 \(String(format: "%.3f", t3)) ms")
-        XCTAssertEqual(delta, 0)
-      }
-    }
-    for (height, width) in [(544, 960), (1088, 1920), (37, 53)] {
-      let x = (MLXRandom.normal([1, height, width, 32]) * 0.5).asType(.float16)
-      let w1 = (MLXRandom.normal([32, 128]) * 0.1).asType(.float16)
-      let w2 = (MLXRandom.normal([128, 32]) * 0.1).asType(.float16)
-      let cos1 = MLXRandom.uniform(low: 0.5, high: 1.0, [32]).asType(.float16)
-      let qkv = (MLXRandom.normal([32, 96]) * 0.1).asType(.float16)
-      let scale = MLXArray([Float(1.2)]).asType(.float16)
-      let bias = (MLXRandom.normal([1, 64, 64]) * 2.0).asType(.float16)
-      let proj = (MLXRandom.normal([32, 32]) * 0.1).asType(.float16)
-      let cos2 = MLXRandom.uniform(low: 0.5, high: 1.0, [32]).asType(.float16)
-      eval(x, w1, w2, cos1, qkv, scale, bias, proj, cos2)
-      for origin in [NeuralRenderingWindowOrigin.zero, NeuralRenderingWindowOrigin(y: -4, x: 0)] {
-        for publish in [true, false] {
-          func run() -> MLXArray {
-            NeuralRenderingFusedWindowBlock.apply(x, expansionWeight: w1, feedForwardProjectionWeight: w2, feedForwardCosine: cos1, qkvWeight: qkv, attentionScale: scale, attentionBias: bias, attentionProjectionWeight: proj, attentionCosine: cos2, windowOrigin: origin, publish: publish)
-          }
-          NeuralRenderingFusedWindowAttention.kernelV3Enabled = false
-          let v1 = run()
-          NeuralRenderingFusedWindowAttention.kernelV3Enabled = true
-          let v3 = run()
-          eval(v1, v3)
-          let delta = abs(v1.asType(.float32) - v3.asType(.float32)).max().item(Float.self)
-          NeuralRenderingFusedWindowAttention.kernelV3Enabled = false
-          let t1 = ms({ [run()] })
-          NeuralRenderingFusedWindowAttention.kernelV3Enabled = true
-          let t3 = ms({ [run()] })
-          print("perf-spike 1h block v3 \(height)x\(width) origin (\(origin.x),\(origin.y)) publish \(publish): max |Δ| \(delta); v1 \(String(format: "%.3f", t1)) ms, v3 \(String(format: "%.3f", t3)) ms")
-          XCTAssertEqual(delta, 0)
-        }
-      }
-    }
-  }
-
-  func testGroupedExpansionIsBitExact() throws {
-    guard enabled else { throw XCTSkip("MLXDLSS_PERF_SPIKE=1") }
-    typealias Ops = NeuralRenderingTransformerOperations
-    let saved = Ops.groupedExpansionEnabled
-    defer { Ops.groupedExpansionEnabled = saved }
-    for (groups, height, width) in [(2, 272, 480), (4, 136, 240), (8, 68, 120), (2, 3, 8), (8, 17, 30)] {
-      let channels = groups * 32
-      let input = (MLXRandom.normal([1, height, width, channels]) * 0.5).asType(.float16)
-      let expansion = (MLXRandom.normal([groups, 4, groups, 32, 32]) * 0.05).asType(.float16)
-      let branch = (MLXRandom.normal([groups, 4, 32, 32]) * 0.05).asType(.float16)
-      let output = (MLXRandom.normal([channels, channels]) * 0.05).asType(.float16)
-      eval(input, expansion, branch, output)
-      let dense = Ops.denseExpansionWeight(expansion)
-      let grouped = Ops.groupedProjectionWeight(branch)
-      func run() -> MLXArray { Ops.denseBranchedFeedForward(input, denseExpansionWeight: dense, groupedProjectionWeight: grouped, outputProjectionWeight: output) }
-      Ops.groupedExpansionEnabled = false
-      let reference = run()
-      Ops.groupedExpansionEnabled = true
-      let candidate = run()
-      eval(reference, candidate)
-      let delta = abs(reference.asType(.float32) - candidate.asType(.float32))
-      let maxDelta = delta.max().item(Float.self)
-      let count = (delta .> 0).sum().item(Int32.self)
-      Ops.groupedExpansionEnabled = false
-      let tr = ms({ [run()] })
-      Ops.groupedExpansionEnabled = true
-      let tc = ms({ [run()] })
-      print("perf-spike grouped expansion G=\(groups) \(height)x\(width): max |Δ| \(maxDelta) (\(count) differ); dense chain \(String(format: "%.3f", tr)) ms, grouped \(String(format: "%.3f", tc)) ms")
-      XCTAssertEqual(maxDelta, 0)
     }
   }
 
