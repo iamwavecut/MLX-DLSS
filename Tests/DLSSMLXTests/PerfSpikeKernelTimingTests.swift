@@ -435,6 +435,8 @@ final class PerfSpikeKernelTimingTests: XCTestCase {
       Ops.fusedOutputResidualEnabled = false
       NeuralRenderingStreamedGlobalAttention.v2Enabled = false
       Ops.vectorizedE4M3Enabled = false
+      NeuralRenderingFusedWindowBlock.windowsPerGroup = 1
+      NeuralRenderingStreamedGlobalAttention.wideTiles = false
       for item in config.split(separator: ",") {
         let kv = item.split(separator: "=").map(String.init)
         guard kv.count == 2 else { continue }
@@ -444,6 +446,8 @@ final class PerfSpikeKernelTimingTests: XCTestCase {
         case "FUSED_OUTPUT_RESIDUAL": Ops.fusedOutputResidualEnabled = kv[1] == "1"
         case "GLOBAL_ATTENTION_V2": NeuralRenderingStreamedGlobalAttention.v2Enabled = kv[1] == "1"
         case "E4M3_VEC": Ops.vectorizedE4M3Enabled = kv[1] == "1"
+        case "WINDOW_BATCH": NeuralRenderingFusedWindowBlock.windowsPerGroup = Int(kv[1]) ?? 1
+        case "GLOBAL_TILE": NeuralRenderingStreamedGlobalAttention.wideTiles = kv[1] == "128"
         default: print("perf-spike AB: unknown toggle \(kv[0])")
         }
       }
@@ -755,6 +759,73 @@ final class PerfSpikeKernelTimingTests: XCTestCase {
         report("block1 ffn+residual literal vs fused", b, a)
       default: report("block1 compiled vs eager", compiled(input), eager(input))
       }
+    }
+  }
+
+  // MARK: 19. batched single-head block and wide-tile global attention: exactness + timing
+
+  func testBatchedWindowBlockIsBitExact() throws {
+    guard enabled else { throw XCTSkip("MLXDLSS_PERF_SPIKE=1") }
+    let saved = NeuralRenderingFusedWindowBlock.windowsPerGroup
+    defer { NeuralRenderingFusedWindowBlock.windowsPerGroup = saved }
+    for (height, width) in [(37, 53), (544, 960), (1088, 1920)] {
+      let x = (MLXRandom.normal([1, height, width, 32]) * 0.5).asType(.float16)
+      let w1 = (MLXRandom.normal([32, 128]) * 0.1).asType(.float16)
+      let w2 = (MLXRandom.normal([128, 32]) * 0.1).asType(.float16)
+      let cos1 = MLXRandom.uniform(low: 0.5, high: 1.0, [32]).asType(.float16)
+      let qkv = (MLXRandom.normal([32, 96]) * 0.1).asType(.float16)
+      let scale = MLXArray([Float(1.2)]).asType(.float16)
+      let bias = (MLXRandom.normal([1, 64, 64]) * 2.0).asType(.float16)
+      let proj = (MLXRandom.normal([32, 32]) * 0.1).asType(.float16)
+      let cos2 = MLXRandom.uniform(low: 0.5, high: 1.0, [32]).asType(.float16)
+      eval(x, w1, w2, cos1, qkv, scale, bias, proj, cos2)
+      for origin in [NeuralRenderingWindowOrigin.zero, NeuralRenderingWindowOrigin(y: -4, x: -4), NeuralRenderingWindowOrigin(y: 0, x: -4)] {
+        for publish in [true, false] {
+          func run() -> MLXArray {
+            NeuralRenderingFusedWindowBlock.apply(x, expansionWeight: w1, feedForwardProjectionWeight: w2, feedForwardCosine: cos1, qkvWeight: qkv, attentionScale: scale, attentionBias: bias, attentionProjectionWeight: proj, attentionCosine: cos2, windowOrigin: origin, publish: publish)
+          }
+          NeuralRenderingFusedWindowBlock.windowsPerGroup = 1
+          let reference = run(); eval(reference)
+          var line = "perf-spike batched 1h block \(height)x\(width) origin (\(origin.x),\(origin.y)) publish \(publish):"
+          let t1 = ms({ [run()] })
+          line += String(format: " batch1 %.3f ms", t1)
+          for batch in [2, 4] {
+            NeuralRenderingFusedWindowBlock.windowsPerGroup = batch
+            let candidate = run(); eval(candidate)
+            let delta = abs(reference.asType(.float32) - candidate.asType(.float32)).max().item(Float.self)
+            let t = ms({ [run()] })
+            line += String(format: " | batch%d %.3f ms max |Δ| %g", batch, t, delta)
+            XCTAssertEqual(delta, 0, "batch \(batch) must be bit-exact at \(height)x\(width) origin \(origin) publish \(publish)")
+          }
+          print(line)
+        }
+      }
+    }
+  }
+
+  func testWideTileGlobalAttentionIsBitExact() throws {
+    guard enabled else { throw XCTSkip("MLXDLSS_PERF_SPIKE=1") }
+    let savedWide = NeuralRenderingStreamedGlobalAttention.wideTiles
+    let savedV2 = NeuralRenderingStreamedGlobalAttention.v2Enabled
+    defer { NeuralRenderingStreamedGlobalAttention.wideTiles = savedWide; NeuralRenderingStreamedGlobalAttention.v2Enabled = savedV2 }
+    NeuralRenderingStreamedGlobalAttention.v2Enabled = true
+    for (tokens, heads) in [(1030, 4), (1152, 4), (1280, 4), (2040, 8), (2040, 32), (2176, 8)] {
+      let (query, key, value) = globalInputs(tokens: tokens, heads: heads)
+      let reference = globalReference(query: query, key: key, value: value)
+      NeuralRenderingStreamedGlobalAttention.wideTiles = false
+      let narrow = NeuralRenderingStreamedGlobalAttention.apply(query: query, key: key, value: value)
+      NeuralRenderingStreamedGlobalAttention.wideTiles = true
+      let wide = NeuralRenderingStreamedGlobalAttention.apply(query: query, key: key, value: value)
+      eval(reference, narrow, wide)
+      let dNarrow = abs(reference.asType(.float32) - narrow.asType(.float32)).max().item(Float.self)
+      let dWide = abs(reference.asType(.float32) - wide.asType(.float32)).max().item(Float.self)
+      let tm = ms({ [globalReference(query: query, key: key, value: value)] })
+      NeuralRenderingStreamedGlobalAttention.wideTiles = false
+      let tn = ms({ [NeuralRenderingStreamedGlobalAttention.apply(query: query, key: key, value: value)] })
+      NeuralRenderingStreamedGlobalAttention.wideTiles = true
+      let tw = ms({ [NeuralRenderingStreamedGlobalAttention.apply(query: query, key: key, value: value)] })
+      print("perf-spike wide global attention \(tokens) tokens \(heads)h: max |Δ| narrow \(dNarrow) wide \(dWide); materialized \(String(format: "%.3f", tm)) ms, 32-key \(String(format: "%.3f", tn)) ms, 128-key \(String(format: "%.3f", tw)) ms")
+      XCTAssertEqual(dWide, 0, "wide tiles must match the reference at \(tokens) tokens")
     }
   }
 }
