@@ -18,9 +18,9 @@ else
 fi
 swift build -c release --build-tests -Xswiftc -enable-testing
 bin_path="$(swift build -c release --show-bin-path)"
-if [[ ! -f "$bin_path/mlx.metallib" ]]; then
+# Always refresh: a colocated library from another MLX version would shadow the build's own.
+MLXDLSS_PREPARE_SKIP_SWIFT_BUILD=1 MLXDLSS_BUILD_CONFIGURATION=release \
   scripts/prepare-mlx-metallib.sh "$bin_path" "$bin_path/MLXDLSSPackageTests.xctest/Contents/MacOS"
-fi
 if [[ ${#weights[@]} -eq 0 ]]; then
   echo "external weights: not found, external-weight cases will skip" >&2
   swift test -c release -Xswiftc -enable-testing --skip-build

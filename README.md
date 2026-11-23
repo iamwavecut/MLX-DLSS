@@ -20,6 +20,11 @@ weights are included or downloaded.
 
 ## Changelog
 
+- **2026-11-23**: MLX 0.33 with the same output; the app ships MLX's 4.7 MB
+  runtime-compiled kernel library instead of the full one (155 → 68 MB).
+  `mlxdlss device` shows whether MLX uses the GPU Neural Accelerators of M5
+  and M6, and `scripts/bench-neural-accelerators.sh` compares the paths there
+  ([details](docs/embedding.md#mlx-033-and-the-gpu-neural-accelerators-2026-11-23)).
 - **2026-10-17**: supports the 2× faster DLSS 5 neural rendering model from
   [NVIDIA's October update](https://www.nvidia.com/en-us/geforce/news/dlss-5-faster-ai-model-hogwarts-legacy-rtx-spark-laptops/)
   (the small network; extract it from `nvngx_dlssnr.dll` 310.9.16.0).
@@ -38,7 +43,9 @@ the app. Other platforms use the portable Python pipeline.
 
 ## macOS quick start
 
-Requires Apple Silicon, macOS 26+, Xcode with Swift 6.2+, CMake and Ninja.
+Requires Apple Silicon, macOS 26+ and Xcode with Swift 6.2+. CMake and Ninja are
+needed only when SwiftPM does not compile MLX's Metal library itself (see
+`scripts/prepare-mlx-metallib.sh`).
 
 ```sh
 scripts/build-native-app.sh
@@ -147,10 +154,11 @@ For the web's Metal backend (image/tensor APIs support macOS 14+):
 
 ```sh
 swift build -c release
-scripts/prepare-mlx-metallib.sh "$(swift build -c release --show-bin-path)"
+MLXDLSS_BUILD_CONFIGURATION=release scripts/prepare-mlx-metallib.sh "$(swift build -c release --show-bin-path)"
 ```
 
-Repeat after a clean build to place `mlx.metallib` beside the binary.
+Repeat after a clean build or an MLX update to place a matching `mlx.metallib`
+beside the binary.
 For custom FFmpeg filters, RGB16 video, PyTorch, Core ML conversion and the
 Python API, see the [Python guide](python/README.md).
 

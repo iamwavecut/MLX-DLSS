@@ -126,9 +126,12 @@ public actor MLXNeuralRenderer: NeuralRenderBackend {
     case .eager, .blockCompiled, .int8Fast, .metalFused:
       self.compiledModel = nil
     case .compiled:
-      self.compiledModel = compile { input in
+      // The compiled graph captures the model, which is not Sendable; the
+      // renderer serializes calls into it like the uncompiled paths.
+      nonisolated(unsafe) let compiled = compile(inputs: []) { input in
         model.statelessOutput(input)
       }
+      self.compiledModel = { compiled($0) }
     }
   }
 

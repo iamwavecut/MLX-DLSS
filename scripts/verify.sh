@@ -71,6 +71,6 @@ fi
 
 SWIFTPM_MAXIMUM_CONCURRENT_JOBS=2 swift build -c release --jobs 2
 release_bin="$(swift build -c release --show-bin-path)"
-scripts/prepare-mlx-metallib.sh "$release_bin"
+MLXDLSS_PREPARE_SKIP_SWIFT_BUILD=1 MLXDLSS_BUILD_CONFIGURATION=release scripts/prepare-mlx-metallib.sh "$release_bin"
 
 echo "verification: passed"

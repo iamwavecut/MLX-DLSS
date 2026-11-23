@@ -55,7 +55,7 @@ public final class FrameGenerator {
   nonisolated(unsafe) static var profileEnabled: Bool = ProcessInfo.processInfo.environment["MLXDLSS_FG_PROFILE"] == "1"
   /// `MLXDLSS_FG_FUSED_INPUTS=0` assembles the block inputs with MLX operations (diagnostics).
   nonisolated(unsafe) static var fusedInputsEnabled: Bool = ProcessInfo.processInfo.environment["MLXDLSS_FG_FUSED_INPUTS"] != "0"
-  private lazy var compiledSynthesize: @Sendable ([MLXArray]) -> [MLXArray] = compile(shapeless: false) { [self] inputs in
+  private lazy var compiledSynthesize: ([MLXArray]) -> [MLXArray] = compile(inputs: [], shapeless: false) { [self] inputs in
     [self.synthesizeGraph(inputs[0], inputs[1], phases: inputs[2])]
   }
 

@@ -150,7 +150,7 @@ final class NeuralRenderingGlobalBlockABTests: XCTestCase {
     let w = Weights(seed: seed)
     let current = try NeuralRenderingGlobalBlock(
       weights: w.validated, blockIndex: 0, preciseAttention: true, fusedOperations: true, compileGraph: true)
-    return (compile { (input: MLXArray) -> MLXArray in Self.previousBlock(input, w) }, current)
+    return (compile(inputs: []) { (input: MLXArray) -> MLXArray in Self.previousBlock(input, w) }, current)
   }
 
   func testGlobalBlockMatchesPreviousPipelineBitForBit() throws {

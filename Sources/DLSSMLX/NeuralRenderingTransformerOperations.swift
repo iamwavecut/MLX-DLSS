@@ -580,7 +580,7 @@ struct NeuralRenderingGlobalBlock {
     }
     self.body = body
     if compileGraph && fusedOperations {
-      self.compiledBody = compile { (input: MLXArray) -> MLXArray in body(input) }
+      self.compiledBody = compile(inputs: []) { (input: MLXArray) -> MLXArray in body(input) }
     } else {
       self.compiledBody = nil
     }

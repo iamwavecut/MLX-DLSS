@@ -392,6 +392,52 @@ takes 0.54–0.58 s at 1216×1664. The reused session returns the same preview
 as a new one. The first preview after launch takes 1.3–1.9 s: 0.34 s to load
 the renderer, 0.43 s for the first network frames and 0.4 s for the session.
 
+### MLX 0.33 and the GPU Neural Accelerators (2026-11-23)
+
+mlx-swift 0.33.0 (MLX 0.32.4) replaces 0.31.6. On the M2 Max both networks
+return the same output bit for bit (SHA-256 at 384×384, 768×1024 and
+1088×1920, two inputs each), and frame times stay within the run-to-run noise.
+
+mlx-swift builds MLX in JIT mode: GEMM, convolution, attention and elementwise
+kernels compile from source at first use. `scripts/prepare-mlx-metallib.sh`
+now copies the 4.7 MB library that Swift Build compiles into
+`mlx-swift_Cmlx.bundle` instead of building MLX's full library with CMake
+(147 MB for MLX 0.32.4, 108 MB for 0.31.6). Outputs are unchanged, and
+`.build/MLX DLSS.app` shrank from 155 MB to 68 MB. CMake and Ninja remain the
+fallback when the bundle has no library.
+
+M5, M6 and later have a Neural Accelerator in every GPU core. On macOS 26.2
+and later MLX routes float16 and bfloat16 matrix multiplications there through
+JIT-compiled Metal 4 tensor kernels; in this network these are the global
+stage's GEMMs. The custom window, single-head and feed-forward kernels use
+simdgroup matrix instructions on the shader cores.
+
+- `mlxdlss device` prints the GPU architecture and whether MLX uses the Neural
+  Accelerators in this process (`MLXGPUProfile`).
+- `MLX_METAL_GPU_ARCH=applegpu_g16s` on an M5 Pro or Max makes MLX take the
+  shader path; forcing a Neural Accelerator architecture on an older GPU
+  returns wrong output.
+- `MLXDLSS_TENSOR_OPS_FFN=1` (macOS 26 and later) runs the fused feed-forward
+  at 64 and 128 channels as `matmul2d` tensor operations, which the Neural
+  Accelerators execute; `MLXDLSS_TENSOR_OPS_FFN_ROWS` selects 16 or 32 rows per
+  simdgroup. On the M2 Max it matches the simdgroup kernel bit for bit, in the
+  whole network too, and is not faster (minimum of 15 samples, 1088×1920
+  shapes):
+
+  | Shape | Simdgroup kernel | Tensor ops, 16 rows | Tensor ops, 32 rows |
+  | --- | --- | --- | --- |
+  | 64 ch, 272×480 | 0.98 ms | 1.00 ms | 1.39 ms |
+  | 128 ch, 136×240 | 0.83 ms | 0.88 ms | 1.25 ms |
+
+- `scripts/bench-neural-accelerators.sh` compares, on M5 or M6, the Neural
+  Accelerator path, the shader path and the tensor-operation feed-forward:
+  output difference from the first configuration, then alternating whole-frame
+  timings. With arguments it compares any environment configurations, for
+  example `'fused=' 'chain=MLXDLSS_FUSED_FFN=0'`.
+
+No M5 or M6 measurement exists yet; the tensor-operation feed-forward stays
+off until one shows a gain.
+
 ### Earlier measurements
 
 Same 228-frame 512×384, 60 fps clip, temporal rendering, detail 2:

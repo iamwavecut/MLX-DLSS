@@ -1198,6 +1198,21 @@ final class CLITests: XCTestCase {
     }
   }
 
+  func testDeviceReportsTheGPUAndNeuralAcceleratorUse() throws {
+    let result = try runCLI(["device"])
+    XCTAssertEqual(result.status, 0, result.stderr)
+    let object = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any]
+    )
+    XCTAssertFalse((object["device"] as? String ?? "").isEmpty)
+    XCTAssertTrue((object["architecture"] as? String ?? "").hasPrefix("applegpu_"))
+    XCTAssertNotNil(object["neuralAccelerators"] as? Bool)
+    XCTAssertNotNil(object["mlxUsesNeuralAccelerators"] as? Bool)
+
+    let extra = try runCLI(["device", "unexpected"])
+    XCTAssertEqual(extra.status, 2)
+  }
+
   func testMalformedPackageExitsTwoWithoutCrashDump() throws {
     let temporaryDirectory = try makeTemporaryDirectory()
     defer { try? FileManager.default.removeItem(at: temporaryDirectory) }

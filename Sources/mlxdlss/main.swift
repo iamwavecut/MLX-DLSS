@@ -55,7 +55,7 @@ enum CLIOutput {
 func runCommand(_ arguments: [String]) async throws {
     guard let command = arguments.first else {
         throw CLIError.usage(
-            "expected process-video, process-image, preview-stream, inspect, run, run-sequence, render-image, framegen, framegen-stream, or stream"
+            "expected process-video, process-image, preview-stream, inspect, device, run, run-sequence, render-image, framegen, framegen-stream, or stream"
         )
     }
     let commandArguments = Array(arguments.dropFirst())
@@ -68,6 +68,8 @@ func runCommand(_ arguments: [String]) async throws {
         try await ProcessMediaCommand.run(arguments: commandArguments, video: false)
     case "render-image":
         try await RenderImageCommand.run(arguments: commandArguments)
+    case "device":
+        try DeviceCommand.run(arguments: commandArguments)
     case "inspect":
         try InspectCommand.run(arguments: commandArguments)
     case "run":

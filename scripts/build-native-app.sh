@@ -11,8 +11,8 @@ BIN_PATH="$(swift build --package-path "$PROJECT_ROOT" -c "$CONFIGURATION" --sho
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BIN_PATH/MLXDLSSApp" "$APP_PATH/Contents/MacOS/MLXDLSSApp"
 cp "$BIN_PATH/mlxdlss" "$APP_PATH/Contents/MacOS/mlxdlss"
-MLXDLSS_PREPARE_SKIP_SWIFT_BUILD=1 "$PROJECT_ROOT/scripts/prepare-mlx-metallib.sh" \
-  "$APP_PATH/Contents/MacOS" "$BIN_PATH"
+MLXDLSS_PREPARE_SKIP_SWIFT_BUILD=1 MLXDLSS_BUILD_CONFIGURATION="$CONFIGURATION" \
+  "$PROJECT_ROOT/scripts/prepare-mlx-metallib.sh" "$APP_PATH/Contents/MacOS" "$BIN_PATH"
 
 cat > "$APP_PATH/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

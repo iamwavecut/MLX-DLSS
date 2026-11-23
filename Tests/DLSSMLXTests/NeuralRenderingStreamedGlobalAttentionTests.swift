@@ -87,7 +87,7 @@ final class NeuralRenderingStreamedGlobalAttentionTests: XCTestCase {
     guard env["MLXDLSS_GLOBAL_COMPILE_TIMING"] == "1", let path = env["MLXDLSS_LOGICAL_WEIGHTS"] else { throw XCTSkip("Set MLXDLSS_GLOBAL_COMPILE_TIMING=1 and real weights") }
     let weights = ValidatedWeights(arrays: try loadArrays(url: URL(fileURLWithPath: path), stream: .cpu)).cast(to: .float16)
     let block = try NeuralRenderingGlobalBlock(weights: weights, blockIndex: 31, fusedOperations: true)
-    let compiled = compile { block($0) }
+    let compiled = compile(inputs: []) { block($0) }
     for rows in [48, 192, 510, 768] {
       let x = NeuralRenderingTransformerOperations.e4m3RoundTrip((MLXRandom.normal([1, 1, rows, 1024]) * 0.2).asType(.float16))
       let a = block(x), b = compiled(x)
