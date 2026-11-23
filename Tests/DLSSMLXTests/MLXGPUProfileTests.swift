@@ -45,6 +45,11 @@ final class MLXGPUProfileTests: XCTestCase {
   func testCurrentProfileDescribesThisMachine() throws {
     let current = try XCTUnwrap(MLXGPUProfile.current)
     XCTAssertFalse(current.deviceName.isEmpty)
-    XCTAssertNotNil(current.deviceGeneration)
+    if current.deviceArchitecture.hasPrefix("applegpu_") {
+      XCTAssertNotNil(current.deviceGeneration, current.deviceArchitecture)
+    } else {
+      // A virtual GPU (GitHub's macOS runners) has no Apple GPU generation.
+      XCTAssertFalse(current.hasNeuralAccelerators, current.deviceArchitecture)
+    }
   }
 }

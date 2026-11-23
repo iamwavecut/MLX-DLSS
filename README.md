@@ -44,8 +44,8 @@ the app. Other platforms use the portable Python pipeline.
 ## macOS quick start
 
 Requires Apple Silicon, macOS 26+ and Xcode with Swift 6.2+. CMake and Ninja are
-needed only when SwiftPM does not compile MLX's Metal library itself (see
-`scripts/prepare-mlx-metallib.sh`).
+needed only when `swift build` does not compile MLX's Metal library itself, as
+with Xcode 26.6 (see `scripts/prepare-mlx-metallib.sh`).
 
 ```sh
 scripts/build-native-app.sh

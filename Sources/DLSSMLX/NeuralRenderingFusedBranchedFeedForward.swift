@@ -41,12 +41,37 @@ enum NeuralRenderingFusedBranchedFeedForward {
   /// compiles custom kernels as Metal 4). On an M2 Max it matches the simdgroup
   /// kernel bit for bit and is not faster; it has not been timed on Neural
   /// Accelerator hardware, whose accumulation order can differ.
-  /// `scripts/bench-neural-accelerators.sh` compares both paths there.
+  /// `scripts/bench-neural-accelerators.sh` compares both paths there. When Metal
+  /// cannot compile the kernel on this GPU (`tensorOpsCompile`), the simdgroup
+  /// kernel stays in use.
   nonisolated(unsafe) static var tensorOpsEnabled: Bool = {
     guard ProcessInfo.processInfo.environment["MLXDLSS_TENSOR_OPS_FFN"] == "1" else { return false }
-    if #available(macOS 26.0, iOS 26.0, *) { return true }
+    if tensorOpsCompile(rowsPerSimdgroup: tensorOpsRowsPerSimdgroup) { return true }
+    FileHandle.standardError.write(
+      Data("MLXDLSS_TENSOR_OPS_FFN=1: Metal cannot compile the tensor-operation kernel on this GPU; using the simdgroup kernel\n".utf8))
     return false
   }()
+
+  /// True when Metal compiles and runs the tensor-operation kernel at 64 and 128
+  /// channels with `rows` rows per simdgroup. MLX reports a failed compile as an
+  /// error, which `checkedEval` throws instead of stopping the process. The
+  /// virtual GPU of GitHub's macOS 26.7 runners fails to compile it.
+  static func tensorOpsCompile(rowsPerSimdgroup rows: Int) -> Bool {
+    guard #available(macOS 26.0, iOS 26.0, *) else { return false }
+    let zeros = { (shape: [Int]) in MLXArray.zeros(shape, dtype: .float16) }
+    do {
+      for channels in [64, 128] {
+        try checkedEval(
+          applyTensorOps(
+            zeros([1, 2, 2, channels]), denseExpansionWeight: zeros([channels, channels * 4]),
+            groupedProjectionWeight: zeros([channels / 32, 128, 32]), outputProjectionWeight: zeros([channels, channels]),
+            cosine: zeros([channels]), rowsPerSimdgroup: rows))
+      }
+      return true
+    } catch {
+      return false
+    }
+  }
   /// Rows per simdgroup of the tensor-operation variant (16 or 32).
   nonisolated(unsafe) static var tensorOpsRowsPerSimdgroup: Int =
     ProcessInfo.processInfo.environment["MLXDLSS_TENSOR_OPS_FFN_ROWS"].flatMap(Int.init).flatMap { [16, 32].contains($0) ? $0 : nil } ?? 16

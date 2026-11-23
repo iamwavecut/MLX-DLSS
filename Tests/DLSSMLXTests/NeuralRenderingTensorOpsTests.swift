@@ -18,7 +18,23 @@ final class NeuralRenderingTensorOpsTests: XCTestCase {
   }
 
   private func requireTensorOperations() throws {
-    guard #available(macOS 26.0, iOS 26.0, *) else { throw XCTSkip("Metal 4 tensor operations need macOS 26") }
+    for rows in [16, 32] where !NeuralRenderingFusedBranchedFeedForward.tensorOpsCompile(rowsPerSimdgroup: rows) {
+      throw XCTSkip("Metal does not compile the tensor-operation kernel (\(rows) rows) on this GPU or OS")
+    }
+  }
+
+  /// A kernel that Metal fails to compile, as the tensor-operation kernel does on
+  /// the virtual GPU of GitHub's macOS runners, must throw from `checkedEval`
+  /// instead of stopping the process, and MLX must keep working after it.
+  func testKernelCompileFailureThrowsAndMLXKeepsWorking() {
+    let broken = MLXFast.metalKernel(
+      name: "mlxdlss_compile_failure_probe", inputNames: ["input"], outputNames: ["output"],
+      source: "this is not Metal;")
+    let input = MLXArray.zeros([4], dtype: .float16)
+    XCTAssertThrowsError(
+      try checkedEval(
+        broken([input], grid: (4, 1, 1), threadGroup: (4, 1, 1), outputShapes: [[4]], outputDTypes: [.float16])[0]))
+    XCTAssertEqual((MLXArray(0 ..< 10) * 2).sum().item(Int.self), 90)
   }
 
   func testTensorOpsFeedForwardMatchesTheSimdgroupKernel() throws {

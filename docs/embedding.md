@@ -404,7 +404,9 @@ now copies the 4.7 MB library that Swift Build compiles into
 `mlx-swift_Cmlx.bundle` instead of building MLX's full library with CMake
 (147 MB for MLX 0.32.4, 108 MB for 0.31.6). Outputs are unchanged, and
 `.build/MLX DLSS.app` shrank from 155 MB to 68 MB. CMake and Ninja remain the
-fallback when the bundle has no library.
+fallback when the bundle has no library: the native SwiftPM build system, which
+`swift build` from Xcode 26.6 on the CI runner uses, does not compile Metal
+sources.
 
 M5, M6 and later have a Neural Accelerator in every GPU core. On macOS 26.2
 and later MLX routes float16 and bfloat16 matrix multiplications there through
@@ -436,7 +438,10 @@ simdgroup matrix instructions on the shader cores.
   example `'fused=' 'chain=MLXDLSS_FUSED_FFN=0'`.
 
 No M5 or M6 measurement exists yet; the tensor-operation feed-forward stays
-off until one shows a gain.
+off until one shows a gain. Before the first use, `MLXDLSS_TENSOR_OPS_FFN=1`
+compiles and runs the kernel once. If Metal cannot compile it, as on the virtual
+GPU of GitHub's macOS 26.7 runners, it prints a warning and keeps the simdgroup
+kernel.
 
 ### Earlier measurements
 
